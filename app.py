@@ -372,10 +372,37 @@ with tab_sync:
     elif not client_id or not client_secret:
         st.warning("⚠️ 사이드바에서 Client ID와 Secret을 먼저 설정하세요.")
     else:
-        st.markdown("#### 📋 동기화 대상 연동 채널:")
-        for t in tokens:
-            st.markdown(f"- 📺 **{t['channel_title']}** (`{t['channel_id']}`) — *등록일: {t['created_at']}*")
-        st.caption(f"총 **{len(tokens)}개** 채널의 구독 목록을 순회하여 중복 없이 수집합니다.")
+        st.markdown("#### 📋 동기화 대상 브랜드 채널 선택")
+        st.caption("여러 계정이나 브랜드 채널을 등록했을 때, 특정 채널의 구독 목록만 선택적으로 수집하여 시간과 API 쿼터 소모를 방지할 수 있습니다.")
+
+        channel_map = {t["channel_id"]: t["channel_title"] for t in tokens}
+        all_channel_ids = list(channel_map.keys())
+
+        # Quick select buttons
+        q_col1, q_col2, q_col3 = st.columns([1, 1, 3])
+        with q_col1:
+            if st.button("모두 선택", key="btn_sync_all_channels", use_container_width=True):
+                st.session_state["sync_target_channels_selector"] = all_channel_ids
+                st.rerun()
+        with q_col2:
+            if st.button("선택 해제", key="btn_sync_clear_channels", use_container_width=True):
+                st.session_state["sync_target_channels_selector"] = []
+                st.rerun()
+
+        selected_channels = st.multiselect(
+            "구독 목록을 수집할 브랜드 채널을 선택하세요:",
+            options=all_channel_ids,
+            default=all_channel_ids,
+            format_func=lambda cid: f"📺 {channel_map.get(cid, cid)} ({cid[:12]}...)",
+            key="sync_target_channels_selector",
+            help="선택한 채널들의 구독 목록만 순회 수집하여 기존 DB와 통합합니다.",
+        )
+
+        if not selected_channels:
+            st.warning("⚠️ 최소 1개 이상의 브랜드 채널을 선택해야 동기화를 실행할 수 있습니다.")
+        else:
+            selected_names = [f"**{channel_map[cid]}**" for cid in selected_channels if cid in channel_map]
+            st.info(f"🎯 **선택된 동기화 대상 ({len(selected_channels)}개):** {' ｜ '.join(selected_names)}")
 
         st.markdown("---")
         st.markdown("#### ⚙️ 동기화 범위 선택 (개발/운영 모드)")
@@ -409,9 +436,24 @@ with tab_sync:
                 max_ch = None
                 st.info("💡 전체 구독 목록 전수 수집 및 분석")
 
-        btn_label = f"▶ 동기화 파이프라인 실행 ({max_ch}개 부분 수집)" if max_ch else "▶ 전체 동기화 파이프라인 실행"
+        # Dynamic Button Label
+        if not selected_channels:
+            btn_label = "⚠️ 동기화할 채널을 먼저 선택하세요"
+        elif len(selected_channels) == 1:
+            ch_name = channel_map.get(selected_channels[0], "채널")
+            btn_label = f"▶ '{ch_name}' 구독 목록 동기화 실행"
+        else:
+            btn_label = f"▶ 선택된 {len(selected_channels)}개 채널 통합 동기화 실행"
 
-        if st.button(btn_label, type="primary", use_container_width=True):
+        if max_ch:
+            btn_label += f" ({max_ch}개 부분 수집)"
+
+        if st.button(
+            btn_label,
+            type="primary",
+            disabled=(len(selected_channels) == 0),
+            use_container_width=True,
+        ):
             progress_bar = st.progress(0.0)
             status_placeholder = st.empty()
 
@@ -424,6 +466,7 @@ with tab_sync:
                         status_placeholder.info(f"⏳ {msg}"),
                     ),
                     max_channels=max_ch,
+                    target_channel_ids=selected_channels,
                 )
                 progress_bar.progress(1.0)
                 status_placeholder.success(f"🎉 성공적으로 동기화가 완료되었습니다! (총 {total_synced}개 채널 수집 및 판정)")

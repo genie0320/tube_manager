@@ -82,14 +82,16 @@ def run_sync_pipeline(
     client_secret: str,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     max_channels: Optional[int] = None,
+    target_channel_ids: Optional[List[str]] = None,
 ) -> int:
     """
     Executes the TubeSSOT synchronization pipeline:
-    1. Collect subscriptions across all connected accounts and deduplicate by channel_id.
+    1. Collect subscriptions across selected connected accounts and deduplicate by channel_id.
     2. Batch fetch channel metadata via channels.list (chunks of 50).
-    3. Query recent 3 videos via playlistItems.list and calculate liveness.
+    3. Query recent 5 videos via playlistItems.list and calculate liveness.
     4. Upsert all enriched records into SQLite subscriptions_master.
-    If max_channels is specified, only that many channels will be analyzed (useful for rapid testing/development).
+    If target_channel_ids is specified, only subscriptions belonging to those connected channels are retrieved.
+    If max_channels is specified, only that many channels will be analyzed.
     Returns total unique channels processed.
     """
     def _notify(percent: float, message: str):
@@ -100,10 +102,26 @@ def run_sync_pipeline(
     if not tokens:
         raise ValueError("등록된 OAuth 계정/채널이 없습니다. 먼저 계정을 연동해 주세요.")
 
+    if target_channel_ids:
+        target_set = set(target_channel_ids)
+        tokens = [t for t in tokens if t["channel_id"] in target_set]
+        if not tokens:
+            raise ValueError("선택된 연동 채널의 유효한 OAuth 토큰을 찾을 수 없습니다.")
+
+    # Load existing subscriptions map to preserve known source accounts across partial syncs
+    existing_records = db.fetch_master_records()
+    db_source_map: Dict[str, Set[str]] = {}
+    for er in existing_records:
+        if er["source_accounts"]:
+            try:
+                db_source_map[er["channel_id"]] = set(json.loads(er["source_accounts"]))
+            except Exception:
+                db_source_map[er["channel_id"]] = set()
+
     merged_subscriptions: Dict[str, Dict[str, Any]] = {}
     valid_tokens = []
 
-    # Step 1: Iterate over all tokens and collect subscriptions
+    # Step 1: Iterate over targeted tokens and collect subscriptions
     total_tokens = len(tokens)
     for idx, token in enumerate(tokens):
         ch_title = token["channel_title"]
@@ -121,6 +139,11 @@ def run_sync_pipeline(
                         if src not in merged_subscriptions[c_id]["source_accounts"]:
                             merged_subscriptions[c_id]["source_accounts"].append(src)
                 else:
+                    # Merge with existing DB source accounts if present
+                    if c_id in db_source_map:
+                        for src in db_source_map[c_id]:
+                            if src not in data["source_accounts"]:
+                                data["source_accounts"].append(src)
                     merged_subscriptions[c_id] = data
         except Exception as e:
             _notify(
