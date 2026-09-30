@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from google_auth_oauthlib.flow import InstalledAppFlow, Flow
 from googleapiclient.discovery import build
 import openpyxl
@@ -573,7 +574,7 @@ def render_channel_cards_grid(
     is_archived_view: bool = False,
     page_key_prefix: str = "active",
 ):
-    """Renders a responsive 3-column card grid with pagination and identical card heights."""
+    """Renders a responsive 3-column card grid with infinite scroll on user scroll."""
     if not items:
         if is_archived_view:
             st.info("ℹ️ 현재 보류된 채널이 없습니다. '3. 통합 구독 대시보드'에서 채널 카드의 [📦 보류] 버튼을 누르면 이 보관함으로 이동합니다.")
@@ -581,44 +582,19 @@ def render_channel_cards_grid(
             st.info("ℹ️ 검색 또는 필터 조건에 부합하는 활성 구독 채널이 없습니다.")
         return
 
-    page_size = 18
+    batch_size = 24
     total_cards = len(items)
-    total_pages = max(1, (total_cards + page_size - 1) // page_size)
 
-    page_key = f"{page_key_prefix}_card_page"
-    if page_key not in st.session_state:
-        st.session_state[page_key] = 1
-    if st.session_state[page_key] > total_pages:
-        st.session_state[page_key] = 1
+    visible_key = f"{page_key_prefix}_visible_count"
+    if visible_key not in st.session_state:
+        st.session_state[visible_key] = batch_size
 
-    # Pagination Bar
-    col_pg1, col_pg2, col_pg3, col_pg4 = st.columns([1.5, 3, 1.5, 2])
-    with col_pg1:
-        if st.button("◀ 이전 페이지", key=f"prev_pg_{page_key_prefix}", disabled=(st.session_state[page_key] <= 1), use_container_width=True):
-            st.session_state[page_key] -= 1
-            st.rerun()
-    with col_pg2:
-        st.markdown(f"<div style='text-align: center; line-height: 2.2; font-weight: bold;'>페이지 {st.session_state[page_key]} / {total_pages} (총 {total_cards:,}개)</div>", unsafe_allow_html=True)
-    with col_pg3:
-        if st.button("다음 페이지 ▶", key=f"next_pg_{page_key_prefix}", disabled=(st.session_state[page_key] >= total_pages), use_container_width=True):
-            st.session_state[page_key] += 1
-            st.rerun()
-    with col_pg4:
-        new_page = st.number_input(
-            "이동",
-            min_value=1,
-            max_value=total_pages,
-            value=st.session_state[page_key],
-            key=f"jump_pg_{page_key_prefix}",
-            label_visibility="collapsed",
-        )
-        if new_page != st.session_state[page_key]:
-            st.session_state[page_key] = new_page
-            st.rerun()
+    # Limit slice to available items
+    current_visible = min(total_cards, st.session_state[visible_key])
+    page_items = items[:current_visible]
 
-    start_idx = (st.session_state[page_key] - 1) * page_size
-    end_idx = min(start_idx + page_size, total_cards)
-    page_items = items[start_idx:end_idx]
+    # Live progress caption
+    st.caption(f"📊 현재 **{current_visible:,}개** / 전체 **{total_cards:,}개** 채널 노출 중 (아래로 스크롤 시 자동 추가 로딩)")
 
     cards_per_row = 3
     for r_idx in range(0, len(page_items), cards_per_row):
@@ -689,6 +665,105 @@ def render_channel_cards_grid(
                                         db.delete_master_channel(ch["channel_id"])
                                         st.toast(f"'{ch['title']}' 채널이 DB에서 삭제되었습니다.", icon="🗑️")
                                         st.rerun()
+
+    # Infinite Scroll Bottom Area
+    if current_visible < total_cards:
+        remaining = total_cards - current_visible
+        next_count = min(batch_size, remaining)
+        sentinel_id = f"sentinel_{page_key_prefix}"
+
+        # Sentinel element for IntersectionObserver
+        st.markdown(
+            f"""
+            <div id="{sentinel_id}" style="height: 40px; margin: 24px 0 10px 0; text-align: center; display: flex; align-items: center; justify-content: center; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px dashed rgba(255,255,255,0.18);">
+                <span style="color: #aaa; font-size: 0.88rem;">⏳ 아래로 스크롤하면 다음 {next_count}개 채널을 자동으로 불러옵니다...</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Fallback load more button
+        load_col1, load_col2, load_col3 = st.columns([1, 2, 1])
+        with load_col2:
+            if st.button(
+                f"⬇️ {next_count}개 더 불러오기 ({current_visible:,} / {total_cards:,})",
+                key=f"btn_more_{page_key_prefix}",
+                use_container_width=True,
+            ):
+                st.session_state[visible_key] = current_visible + batch_size
+                st.rerun()
+
+        # JavaScript IntersectionObserver for butter-smooth automatic infinite scrolling
+        components.html(
+            f"""
+            <script>
+            (function() {{
+                try {{
+                    const parentWin = window.parent;
+                    const parentDoc = parentWin.document;
+                    const sentinel = parentDoc.getElementById("{sentinel_id}");
+
+                    parentWin.__isLoadingMore = false;
+
+                    if (sentinel && parentWin.IntersectionObserver) {{
+                        const observer = new parentWin.IntersectionObserver((entries) => {{
+                            entries.forEach(entry => {{
+                                if (entry.isIntersecting && !parentWin.__isLoadingMore) {{
+                                    const buttons = Array.from(parentDoc.querySelectorAll('button'));
+                                    const loadBtn = buttons.find(b => 
+                                        b.offsetParent !== null && 
+                                        (b.innerText || b.textContent || '').includes('더 불러오기')
+                                    );
+                                    if (loadBtn) {{
+                                        parentWin.__isLoadingMore = true;
+                                        observer.disconnect();
+                                        loadBtn.click();
+                                    }}
+                                }}
+                            }});
+                        }}, {{
+                            root: null,
+                            rootMargin: '400px',
+                            threshold: 0.01
+                        }});
+
+                        observer.observe(sentinel);
+                    }}
+                }} catch(err) {{
+                    console.error("Infinite scroll error:", err);
+                }}
+            }})();
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
+    else:
+        # All channels loaded indicator + Scroll to top button
+        st.markdown(
+            f"""
+            <div style="text-align: center; padding: 30px 0 10px 0; color: #888;">
+                <div style="font-size: 1.4rem; margin-bottom: 4px;">🎉</div>
+                <div style="font-weight: 600; font-size: 0.95rem;">모든 채널 ({total_cards:,}개)을 다 불러왔습니다.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        top_c1, top_c2, top_c3 = st.columns([1.5, 1, 1.5])
+        with top_c2:
+            if st.button("⬆️ 맨 위로 이동", key=f"btn_top_{page_key_prefix}", use_container_width=True):
+                components.html(
+                    """
+                    <script>
+                    try {
+                        window.parent.scrollTo({top: 0, behavior: 'smooth'});
+                    } catch(e) {}
+                    </script>
+                    """,
+                    height=0,
+                    width=0,
+                )
 
 
 # --- PRELOAD MASTER RECORDS FOR DASHBOARD, ARCHIVE & EXPORT ---
@@ -817,6 +892,12 @@ with tab_dashboard:
             with col_b2:
                 st.caption("휴면 채널들을 한 번에 보관 처리하여 활성 구독 목록을 깔끔하게 정리할 수 있습니다. 보류된 채널은 나중에 보류 보관함에서 언제든 복원할 수 있습니다.")
 
+        # Reset infinite scroll count if filters change
+        current_active_hash = f"{selected_statuses}_{search_keyword}_{selected_category}_{selected_source}"
+        if st.session_state.get("active_filter_hash") != current_active_hash:
+            st.session_state["active_filter_hash"] = current_active_hash
+            st.session_state["active_visible_count"] = 24
+
         view_col1, view_col2 = st.columns([2, 2])
         with view_col1:
             st.caption(f"검색/필터 결과: **{len(filtered_df):,}** 개 채널")
@@ -920,6 +1001,12 @@ with tab_archive:
                 arch_filtered = arch_filtered[arch_filtered["title"].str.contains(arch_keyword.strip(), case=False, na=False)]
             if arch_category != "전체":
                 arch_filtered = arch_filtered[arch_filtered["categories"].apply(lambda cats: arch_category in cats)]
+
+            # Reset infinite scroll count if filters change
+            current_arch_hash = f"{arch_statuses}_{arch_keyword}_{arch_category}"
+            if st.session_state.get("arch_filter_hash") != current_arch_hash:
+                st.session_state["arch_filter_hash"] = current_arch_hash
+                st.session_state["archive_visible_count"] = 24
 
             aview_col1, aview_col2 = st.columns([2, 2])
             with aview_col1:
