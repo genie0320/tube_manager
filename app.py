@@ -91,6 +91,15 @@ col_q1, col_q2 = st.sidebar.columns(2)
 col_q1.metric("오늘 소모 쿼터", f"{today_quota:,} U")
 col_q2.metric("잔여 쿼터", f"{max(0, max_quota - today_quota):,} U")
 
+if st.sidebar.button("🔄 쿼터/화면 새로고침", use_container_width=True):
+    st.rerun()
+
+recent_logs = db.get_recent_quota_logs(limit=5)
+if recent_logs:
+    with st.sidebar.expander("📋 최근 API 소모 내역 (5건)"):
+        for log in recent_logs:
+            st.caption(f"• `{log['created_at'][11:19]}`: +**{log['units']}U** ({log['action']})")
+
 st.sidebar.caption(
     f"기본 무료 할당량(10,000 유닛)의 **{quota_percent * 100:.1f}%** 소모됨.\n"
     "TubeSSOT는 재생목록 캐시(`UU...`) 및 50개 배치 조회를 활용해 극단적인 쿼터 효율성을 보장합니다."
@@ -360,7 +369,41 @@ with tab_sync:
             st.markdown(f"- 📺 **{t['channel_title']}** (`{t['channel_id']}`) — *등록일: {t['created_at']}*")
         st.caption(f"총 **{len(tokens)}개** 채널의 구독 목록을 순회하여 중복 없이 수집합니다.")
 
-        if st.button("▶ 전체 동기화 파이프라인 실행", type="primary", use_container_width=True):
+        st.markdown("---")
+        st.markdown("#### ⚙️ 동기화 범위 선택 (개발/운영 모드)")
+        col_m1, col_m2 = st.columns([3, 2])
+        with col_m1:
+            range_option = st.selectbox(
+                "분석 대상 채널 수 제한:",
+                [
+                    "전체 채널 수집 (All Channels - 운영 모드)",
+                    "빠른 테스트 (10개만 - 초고속 개발용)",
+                    "샘플 수집 (50개)",
+                    "중간 수집 (100개)",
+                    "직접 개수 입력",
+                ],
+                index=0,
+                help="개발 중에는 10개 또는 50개만 부분 수집하여 시간과 API 쿼터를 대폭 절약할 수 있습니다.",
+            )
+        with col_m2:
+            if range_option == "빠른 테스트 (10개만 - 초고속 개발용)":
+                max_ch = 10
+                st.info("⚡ 약 10~15 쿼터 소모 (약 1~2초 소요)")
+            elif range_option == "샘플 수집 (50개)":
+                max_ch = 50
+                st.info("⚡ 약 55 쿼터 소모 (약 3~5초 소요)")
+            elif range_option == "중간 수집 (100개)":
+                max_ch = 100
+                st.info("⚡ 약 105 쿼터 소모 (약 8~10초 소요)")
+            elif range_option == "직접 개수 입력":
+                max_ch = st.number_input("수집할 최대 채널 수:", min_value=1, max_value=5000, value=25)
+            else:
+                max_ch = None
+                st.info("💡 전체 구독 목록 전수 수집 및 분석")
+
+        btn_label = f"▶ 동기화 파이프라인 실행 ({max_ch}개 부분 수집)" if max_ch else "▶ 전체 동기화 파이프라인 실행"
+
+        if st.button(btn_label, type="primary", use_container_width=True):
             progress_bar = st.progress(0.0)
             status_placeholder = st.empty()
 
@@ -372,10 +415,12 @@ with tab_sync:
                         progress_bar.progress(min(1.0, max(0.0, p))),
                         status_placeholder.info(f"⏳ {msg}"),
                     ),
+                    max_channels=max_ch,
                 )
                 progress_bar.progress(1.0)
                 status_placeholder.success(f"🎉 성공적으로 동기화가 완료되었습니다! (총 {total_synced}개 채널 수집 및 판정)")
-                st.toast("동기화가 완료되었습니다. '3. 통합 구독 대시보드'에서 결과를 확인하세요.")
+                st.toast("동기화가 완료되었습니다. 사이드바와 대시보드가 업데이트됩니다.")
+                st.rerun()
             except Exception as e:
                 status_placeholder.error(f"❌ 동기화 중 오류가 발생했습니다: {str(e)}")
 

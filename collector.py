@@ -81,13 +81,15 @@ def run_sync_pipeline(
     client_id: str,
     client_secret: str,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    max_channels: Optional[int] = None,
 ) -> int:
     """
-    Executes the full TubeSSOT synchronization pipeline:
+    Executes the TubeSSOT synchronization pipeline:
     1. Collect subscriptions across all connected accounts and deduplicate by channel_id.
     2. Batch fetch channel metadata via channels.list (chunks of 50).
     3. Query recent 3 videos via playlistItems.list and calculate liveness.
     4. Upsert all enriched records into SQLite subscriptions_master.
+    If max_channels is specified, only that many channels will be analyzed (useful for rapid testing/development).
     Returns total unique channels processed.
     """
     def _notify(percent: float, message: str):
@@ -128,6 +130,9 @@ def run_sync_pipeline(
             continue
 
     unique_channel_ids = list(merged_subscriptions.keys())
+    if max_channels and max_channels > 0:
+        unique_channel_ids = unique_channel_ids[:max_channels]
+
     total_unique = len(unique_channel_ids)
     if total_unique == 0:
         _notify(1.0, "동기화 완료: 수집된 구독 채널이 없습니다.")

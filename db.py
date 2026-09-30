@@ -157,6 +157,16 @@ def get_today_quota(db_file: str = DB_FILE) -> int:
         return int(row["total_units"]) if row else 0
 
 
+def get_recent_quota_logs(limit: int = 10, db_file: str = DB_FILE) -> List[sqlite3.Row]:
+    with get_connection(db_file) as conn:
+        return conn.execute("""
+        SELECT date, units, action, created_at 
+        FROM quota_usage 
+        ORDER BY id DESC 
+        LIMIT ?
+        """, (limit,)).fetchall()
+
+
 def upsert_subscription_record(record: Dict[str, Any], db_file: str = DB_FILE) -> None:
     def _to_json(val: Any) -> str:
         if val is None:
