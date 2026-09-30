@@ -144,6 +144,16 @@ class CoreLogicTestCase(unittest.TestCase):
         self.assertEqual(row["title"], "Awesome Tech Channel")
         self.assertEqual(row["liveness_status"], "GREEN")
         self.assertEqual(row["days_since_last_upload"], 10)
+        self.assertEqual(row["is_archived"], 0)
+
+        # Test archive & restore
+        db.set_channel_archived("UC_sub_target", True, db_file=TEST_DB)
+        records_after_archive = db.fetch_master_records(TEST_DB)
+        self.assertEqual(records_after_archive[0]["is_archived"], 1)
+
+        db.set_channel_archived("UC_sub_target", False, db_file=TEST_DB)
+        records_after_restore = db.fetch_master_records(TEST_DB)
+        self.assertEqual(records_after_restore[0]["is_archived"], 0)
 
         # JSON deserialization checks
         cats = json.loads(row["categories"])

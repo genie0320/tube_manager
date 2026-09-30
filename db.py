@@ -52,15 +52,25 @@ def init_db(db_file: str = DB_FILE) -> None:
             recent_videos TEXT,
             raw_subscription_json TEXT,
             raw_channel_json TEXT,
+            is_archived INTEGER DEFAULT 0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+
+        # Migration: ensure is_archived column exists in existing database
+        cursor.execute("PRAGMA table_info(subscriptions_master);")
+        cols = [row[1] for row in cursor.fetchall()]
+        if cols and "is_archived" not in cols:
+            cursor.execute("ALTER TABLE subscriptions_master ADD COLUMN is_archived INTEGER DEFAULT 0;")
 
         cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_subs_liveness ON subscriptions_master(liveness_status);
         """)
         cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_subs_last_upload ON subscriptions_master(last_upload_at);
+        """)
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_subs_archived ON subscriptions_master(is_archived);
         """)
 
         cursor.execute("""
@@ -126,6 +136,29 @@ def delete_master_channel(channel_id: str, db_file: str = DB_FILE) -> None:
     with get_connection(db_file) as conn:
         conn.execute("DELETE FROM subscriptions_master WHERE channel_id = ?", (channel_id,))
         conn.commit()
+
+
+def set_channel_archived(channel_id: str, is_archived: bool = True, db_file: str = DB_FILE) -> None:
+    with get_connection(db_file) as conn:
+        conn.execute(
+            "UPDATE subscriptions_master SET is_archived = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id = ?",
+            (1 if is_archived else 0, channel_id),
+        )
+        conn.commit()
+
+
+def set_channels_archived_batch(channel_ids: List[str], is_archived: bool = True, db_file: str = DB_FILE) -> None:
+    if not channel_ids:
+        return
+    with get_connection(db_file) as conn:
+        placeholders = ",".join(["?"] * len(channel_ids))
+        params = [1 if is_archived else 0] + list(channel_ids)
+        conn.execute(
+            f"UPDATE subscriptions_master SET is_archived = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id IN ({placeholders})",
+            params,
+        )
+        conn.commit()
+
 
 
 def get_setting(key: str, default: Optional[str] = None, db_file: str = DB_FILE) -> Optional[str]:
