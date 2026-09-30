@@ -529,8 +529,9 @@ with tab_dashboard:
                 st.markdown("#### 🎬 최근 영상 3개")
                 recent_vids = ch_row["recent_videos"]
                 if recent_vids:
-                    v_cols = st.columns(3)
-                    for v_idx, v in enumerate(recent_videos[:3]):
+                    num_cols = max(1, min(3, len(recent_vids)))
+                    v_cols = st.columns(num_cols)
+                    for v_idx, v in enumerate(recent_vids[:num_cols]):
                         with v_cols[v_idx]:
                             with st.container(border=True):
                                 if v.get("thumbnail_url"):
