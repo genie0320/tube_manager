@@ -22,6 +22,7 @@ if not exist ".venv\Scripts\python.exe" (
     )
 )
 
-echo [TubeSSOT] Starting Streamlit Application...
-.\.venv\Scripts\streamlit.exe run app.py
+echo [TubeSSOT] Starting Streamlit Application on http://localhost:8501 ...
+start http://localhost:8501
+.\.venv\Scripts\streamlit.exe run app.py --server.port 8501 --server.headless false
 pause
