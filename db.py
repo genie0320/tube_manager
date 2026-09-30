@@ -122,6 +122,12 @@ def delete_token(channel_id: str, db_file: str = DB_FILE) -> None:
         conn.commit()
 
 
+def delete_master_channel(channel_id: str, db_file: str = DB_FILE) -> None:
+    with get_connection(db_file) as conn:
+        conn.execute("DELETE FROM subscriptions_master WHERE channel_id = ?", (channel_id,))
+        conn.commit()
+
+
 def get_setting(key: str, default: Optional[str] = None, db_file: str = DB_FILE) -> Optional[str]:
     with get_connection(db_file) as conn:
         row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()

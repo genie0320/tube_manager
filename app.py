@@ -430,6 +430,94 @@ with tab_sync:
                 status_placeholder.error(f"❌ 동기화 중 오류가 발생했습니다: {str(e)}")
 
 
+# Helper: format numbers to human-readable Korean units (천, 만, 억)
+def format_count(val: Any, unit: str = "") -> str:
+    if val is None or val == "":
+        return "-"
+    try:
+        num = int(val)
+        if num >= 100_000_000:
+            res = f"{num / 100_000_000:.1f}억"
+        elif num >= 10_000:
+            res = f"{num / 10_000:.1f}만"
+        elif num >= 1_000:
+            res = f"{num / 1_000:.1f}천"
+        else:
+            res = f"{num:,}"
+        return f"{res}{unit}" if unit else res
+    except (ValueError, TypeError):
+        return f"{val}{unit}" if unit else str(val)
+
+
+status_badge_map = {
+    "GREEN": "🟢 활성",
+    "YELLOW": "🟡 정체",
+    "RED": "🔴 휴면",
+    "UNKNOWN": "⚪ 미확인",
+}
+
+
+@st.dialog("📺 채널 상세 정보 및 최근 영상 (최대 5개)", width="large")
+def show_channel_modal(ch: dict):
+    # 상단: 채널 정보
+    c1, c2 = st.columns([1, 4])
+    with c1:
+        if ch.get("thumbnail_url"):
+            st.image(ch["thumbnail_url"], width=120)
+        else:
+            st.markdown("📺")
+    with c2:
+        badge = status_badge_map.get(ch.get("liveness_status"), "")
+        st.markdown(f"### **{ch.get('title')}** {badge}")
+        direct_url = f"https://www.youtube.com/{ch['custom_url']}" if ch.get("custom_url") else f"https://www.youtube.com/channel/{ch.get('channel_id')}"
+        sub_url = f"{direct_url}?sub_confirmation=1"
+        st.markdown(f"[🌐 YouTube 채널 바로가기]({direct_url}) ｜ [🔔 원클릭 구독/확인 링크]({sub_url})")
+
+    # 4 Key Metrics Bar
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("구독자 수", ch.get("subscriber_count_str", "-"))
+    m2.metric("전체 영상 수", ch.get("video_count_str", "-"))
+    m3.metric("최근 업로드일", ch.get("last_upload_at") or "-")
+    days = ch.get("days_since_last_upload")
+    m4.metric("미업로드 경과일수", f"{days:,}일 전" if days is not None else "-")
+
+    if ch.get("categories"):
+        st.markdown(f"🏷️ **카테고리:** {', '.join(ch['categories'])}")
+    if ch.get("source_accounts"):
+        st.markdown(f"👤 **구독 소속 계정:** {', '.join(ch['source_accounts'])}")
+    if ch.get("description"):
+        with st.expander("📝 채널 소개글 보기", expanded=False):
+            st.write(ch["description"])
+
+    st.divider()
+
+    # 하단: 5개의 최근 동영상 목록
+    st.markdown("#### 🎬 최근 업로드 동영상 (최대 5개)")
+    recent_vids = ch.get("recent_videos", [])
+    if recent_vids:
+        num_cols = min(5, len(recent_vids))
+        v_cols = st.columns(num_cols)
+        for v_idx, v in enumerate(recent_vids[:num_cols]):
+            with v_cols[v_idx]:
+                with st.container(border=True):
+                    if v.get("thumbnail_url"):
+                        st.image(v.get("thumbnail_url"), use_container_width=True)
+                    v_title = v.get("title", "제목 없음")
+                    v_url = v.get("video_url", f"https://www.youtube.com/watch?v={v.get('video_id')}")
+                    st.markdown(f"**[{v_title}]({v_url})**")
+                    pub = v.get("published_at", "")[:10]
+                    if pub:
+                        st.caption(f"📅 {pub}")
+    else:
+        st.info("이 채널에 수집된 최근 영상이 없습니다.")
+
+    with st.expander("🛠️ API 원본 JSON 페이로드 (Raw JSON) 검사"):
+        st.json({
+            "raw_subscription": ch.get("raw_subscription_json"),
+            "raw_channel": ch.get("raw_channel_json"),
+        })
+
+
 # ==========================================
 # TAB 3: 통합 구독 관리 대시보드 (SSOT Dashboard)
 # ==========================================
@@ -447,6 +535,12 @@ with tab_dashboard:
         for r in records:
             cats = json.loads(r["categories"]) if r["categories"] else []
             sources = json.loads(r["source_accounts"]) if r["source_accounts"] else []
+            raw_ch = json.loads(r["raw_channel_json"]) if r["raw_channel_json"] else {}
+            stats = raw_ch.get("statistics", {})
+            sub_count = stats.get("subscriberCount")
+            video_count = stats.get("videoCount")
+            view_count = stats.get("viewCount")
+
             for c in cats:
                 all_categories.add(c)
             for s in sources:
@@ -465,9 +559,14 @@ with tab_dashboard:
                 "custom_url": r["custom_url"] or "",
                 "description": r["description"] or "",
                 "thumbnail_url": r["thumbnail_url"] or "",
+                "subscriber_count": sub_count,
+                "video_count": video_count,
+                "view_count": view_count,
+                "subscriber_count_str": format_count(sub_count, "명"),
+                "video_count_str": format_count(video_count, "개"),
                 "recent_videos": json.loads(r["recent_videos"]) if r["recent_videos"] else [],
                 "raw_subscription_json": json.loads(r["raw_subscription_json"]) if r["raw_subscription_json"] else {},
-                "raw_channel_json": json.loads(r["raw_channel_json"]) if r["raw_channel_json"] else {},
+                "raw_channel_json": raw_ch,
             })
 
         df = pd.DataFrame(data_list)
@@ -491,13 +590,12 @@ with tab_dashboard:
         # Multi-filters
         col_f1, col_f2, col_f3, col_f4 = st.columns([2, 3, 2, 2])
         status_opts = ["GREEN", "YELLOW", "RED", "UNKNOWN"]
-        status_labels = {"GREEN": "🟢 활성", "YELLOW": "🟡 정체", "RED": "🔴 휴면", "UNKNOWN": "⚪ 미확인"}
 
         selected_statuses = col_f1.multiselect(
             "신호등 상태 필터",
             options=status_opts,
             default=status_opts,
-            format_func=lambda x: status_labels.get(x, x),
+            format_func=lambda x: status_badge_map.get(x, x),
         )
         search_keyword = col_f2.text_input("🔍 채널명 검색", placeholder="채널명을 입력하세요...")
         selected_category = col_f3.selectbox(
@@ -518,84 +616,154 @@ with tab_dashboard:
         if selected_source != "전체":
             filtered_df = filtered_df[filtered_df["source_accounts"].apply(lambda srcs: selected_source in srcs)]
 
-        st.caption(f"검색/필터 결과: **{len(filtered_df):,}** 개 채널")
+        view_col1, view_col2 = st.columns([2, 2])
+        with view_col1:
+            st.caption(f"검색/필터 결과: **{len(filtered_df):,}** 개 채널")
+        with view_col2:
+            view_mode = st.radio(
+                "보기 방식:",
+                ["🎴 카드 뷰 (Card Grid)", "📋 테이블 뷰 (Table)"],
+                horizontal=True,
+                label_visibility="collapsed",
+            )
 
-        # Display Data Table
-        display_cols = [
-            "liveness_status",
-            "title",
-            "days_since_last_upload",
-            "last_upload_at",
-            "categories_str",
-            "source_accounts_str",
-            "custom_url",
-        ]
-        col_name_map = {
-            "liveness_status": "상태",
-            "title": "채널명",
-            "days_since_last_upload": "미업로드 경과일수",
-            "last_upload_at": "최근 업로드일",
-            "categories_str": "카테고리",
-            "source_accounts_str": "구독 소속 계정",
-            "custom_url": "핸들/URL",
-        }
+        if filtered_df.empty:
+            st.info("검색 또는 필터 조건에 부합하는 구독 채널이 없습니다.")
+        elif view_mode == "🎴 카드 뷰 (Card Grid)":
+            # Card Grid with Pagination
+            page_size = 18
+            total_cards = len(filtered_df)
+            total_pages = max(1, (total_cards + page_size - 1) // page_size)
 
-        # Status badge mapping
-        status_badge_map = {
-            "GREEN": "🟢 활성",
-            "YELLOW": "🟡 정체",
-            "RED": "🔴 휴면",
-            "UNKNOWN": "⚪ 미확인",
-        }
-        grid_df = filtered_df[display_cols].copy()
-        grid_df["liveness_status"] = grid_df["liveness_status"].map(status_badge_map)
-        grid_df.rename(columns=col_name_map, inplace=True)
+            if "card_page" not in st.session_state:
+                st.session_state["card_page"] = 1
+            if st.session_state["card_page"] > total_pages:
+                st.session_state["card_page"] = 1
 
-        st.dataframe(grid_df, use_container_width=True, hide_index=True)
+            # Pagination Bar
+            col_pg1, col_pg2, col_pg3, col_pg4 = st.columns([1.5, 3, 1.5, 2])
+            with col_pg1:
+                if st.button("◀ 이전 페이지", key="prev_pg", disabled=(st.session_state["card_page"] <= 1), use_container_width=True):
+                    st.session_state["card_page"] -= 1
+                    st.rerun()
+            with col_pg2:
+                st.markdown(f"<div style='text-align: center; line-height: 2.2; font-weight: bold;'>페이지 {st.session_state['card_page']} / {total_pages} (총 {total_cards:,}개)</div>", unsafe_allow_html=True)
+            with col_pg3:
+                if st.button("다음 페이지 ▶", key="next_pg", disabled=(st.session_state["card_page"] >= total_pages), use_container_width=True):
+                    st.session_state["card_page"] += 1
+                    st.rerun()
+            with col_pg4:
+                new_page = st.number_input(
+                    "이동",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=st.session_state["card_page"],
+                    key="jump_pg",
+                    label_visibility="collapsed",
+                )
+                if new_page != st.session_state["card_page"]:
+                    st.session_state["card_page"] = new_page
+                    st.rerun()
 
-        # On-Demand Channel Inspector
-        st.divider()
-        st.subheader("🔍 온디맨드 채널 상세 검사 (On-Demand Inspector)")
+            start_idx = (st.session_state["card_page"] - 1) * page_size
+            end_idx = min(start_idx + page_size, total_cards)
+            page_items = filtered_df.iloc[start_idx:end_idx].to_dict(orient="records")
 
-        if not filtered_df.empty:
-            channel_choices = filtered_df["title"].tolist()
-            selected_ch_title = st.selectbox("상세 정보를 확인할 채널을 선택하세요:", channel_choices)
-
-            if selected_ch_title:
-                ch_row = filtered_df[filtered_df["title"] == selected_ch_title].iloc[0]
-
-                header_col1, header_col2 = st.columns([1, 6])
-                with header_col1:
-                    if ch_row["thumbnail_url"]:
-                        st.image(ch_row["thumbnail_url"], width=100)
-                with header_col2:
-                    st.markdown(f"### **{ch_row['title']}** {status_badge_map.get(ch_row['liveness_status'], '')}")
-                    direct_url = f"https://www.youtube.com/{ch_row['custom_url']}" if ch_row["custom_url"] else f"https://www.youtube.com/channel/{ch_row['channel_id']}"
-                    sub_url = f"{direct_url}?sub_confirmation=1"
-                    st.markdown(f"[🌐 채널 바로가기]({direct_url}) | [🔔 원클릭 구독 링크]({sub_url})")
-                    if ch_row["description"]:
-                        st.caption(ch_row["description"][:300] + ("..." if len(ch_row["description"]) > 300 else ""))
-
-                st.markdown("#### 🎬 최근 영상 목록 (최대 5개)")
-                recent_vids = ch_row["recent_videos"]
-                if recent_vids:
-                    num_cols = max(1, min(5, len(recent_vids)))
-                    v_cols = st.columns(num_cols)
-                    for v_idx, v in enumerate(recent_vids[:num_cols]):
-                        with v_cols[v_idx]:
+            cards_per_row = 3
+            for r_idx in range(0, len(page_items), cards_per_row):
+                row_cols = st.columns(cards_per_row)
+                for c_idx in range(cards_per_row):
+                    item_idx = r_idx + c_idx
+                    if item_idx < len(page_items):
+                        ch = page_items[item_idx]
+                        with row_cols[c_idx]:
                             with st.container(border=True):
-                                if v.get("thumbnail_url"):
-                                    st.image(v.get("thumbnail_url"), use_container_width=True)
-                                st.markdown(f"**[{v.get('title')}]({v.get('video_url')})**")
-                                st.caption(f"게시일: {v.get('published_at', '')[:10]}")
-                else:
-                    st.info("이 채널에 게시된 최신 영상이 없습니다.")
+                                # Thumbnail and title header
+                                h_col1, h_col2 = st.columns([1, 2.5])
+                                with h_col1:
+                                    if ch.get("thumbnail_url"):
+                                        st.image(ch["thumbnail_url"], width=80)
+                                    else:
+                                        st.markdown("📺")
+                                with h_col2:
+                                    badge = status_badge_map.get(ch.get("liveness_status"), "")
+                                    st.markdown(f"**{ch['title']}** {badge}")
+                                    if ch.get("custom_url"):
+                                        st.caption(f"{ch['custom_url']}")
+                                    elif ch.get("channel_id"):
+                                        st.caption(f"`{ch['channel_id'][:12]}...`")
 
-                with st.expander("🛠️ API 원본 JSON 페이로드 (Raw JSON) 검사"):
-                    st.json({
-                        "raw_subscription": ch_row["raw_subscription_json"],
-                        "raw_channel": ch_row["raw_channel_json"],
-                    })
+                                # Channel statistics (Subscribers & Total Videos)
+                                st.divider()
+                                st_col1, st_col2 = st.columns(2)
+                                st_col1.markdown(f"👥 **구독자:** {ch.get('subscriber_count_str', '-')}")
+                                st_col2.markdown(f"🎬 **영상:** {ch.get('video_count_str', '-')}")
+
+                                # Liveness / upload activity
+                                days_txt = f"{ch['days_since_last_upload']}일 전" if ch.get("days_since_last_upload") is not None else "-"
+                                st.caption(f"📅 최근 업로드: {ch.get('last_upload_at', '-')[:10]} ({days_txt})")
+
+                                # Direct YouTube URL
+                                direct_url = f"https://www.youtube.com/{ch['custom_url']}" if ch.get("custom_url") else f"https://www.youtube.com/channel/{ch['channel_id']}"
+
+                                # Action buttons
+                                act_col1, act_col2 = st.columns([1.6, 1])
+                                with act_col1:
+                                    if st.button("🔍 상세 / 5영상", key=f"btn_modal_{ch['channel_id']}", type="primary", use_container_width=True):
+                                        show_channel_modal(ch)
+                                with act_col2:
+                                    st.link_button("🌐 바로가기", direct_url, use_container_width=True)
+
+                                # Unsubscribe / DB Removal Popover
+                                with st.popover("❌ [해지] 구독 취소 / DB 정리", use_container_width=True):
+                                    st.markdown(f"**'{ch['title']}'** 구독 해지")
+                                    st.caption("YouTube 계정 보안 정책상 실제 구독 취소는 YouTube 채널 페이지에서 최종 확정됩니다.")
+                                    st.link_button("👉 YouTube에서 구독 취소하기", direct_url, use_container_width=True)
+                                    st.divider()
+                                    st.caption("TubeSSOT 로컬 DB 목록에서 이 채널을 즉시 제외합니다.")
+                                    if st.button("🗑️ DB에서 이 채널 삭제", key=f"del_ch_{ch['channel_id']}", type="secondary", use_container_width=True):
+                                        db.delete_master_channel(ch["channel_id"])
+                                        st.toast(f"'{ch['title']}' 채널이 DB에서 삭제되었습니다.", icon="🗑️")
+                                        st.rerun()
+
+        else:
+            # Table View
+            display_cols = [
+                "liveness_status",
+                "title",
+                "subscriber_count_str",
+                "video_count_str",
+                "days_since_last_upload",
+                "last_upload_at",
+                "categories_str",
+                "source_accounts_str",
+                "custom_url",
+            ]
+            col_name_map = {
+                "liveness_status": "상태",
+                "title": "채널명",
+                "subscriber_count_str": "구독자수",
+                "video_count_str": "전체영상수",
+                "days_since_last_upload": "미업로드 경과일수",
+                "last_upload_at": "최근 업로드일",
+                "categories_str": "카테고리",
+                "source_accounts_str": "구독 소속 계정",
+                "custom_url": "핸들/URL",
+            }
+            grid_df = filtered_df[display_cols].copy()
+            grid_df["liveness_status"] = grid_df["liveness_status"].map(status_badge_map)
+            grid_df.rename(columns=col_name_map, inplace=True)
+            st.dataframe(grid_df, use_container_width=True, hide_index=True)
+
+            # Table mode inspector dropdown
+            st.divider()
+            st.subheader("🔍 채널 상세 검사")
+            channel_choices = filtered_df["title"].tolist()
+            selected_ch_title = st.selectbox("상세 정보를 확인할 채널을 선택하세요:", channel_choices, key="tbl_sel_ch")
+            if selected_ch_title:
+                sel_row = filtered_df[filtered_df["title"] == selected_ch_title].iloc[0].to_dict()
+                if st.button("📺 선택 채널 상세 팝업 열기", type="primary"):
+                    show_channel_modal(sel_row)
 
 
 # ==========================================
@@ -624,11 +792,18 @@ with tab_export:
                 vids = json.loads(r["recent_videos"]) if r["recent_videos"] else []
                 sources = json.loads(r["source_accounts"]) if r["source_accounts"] else []
                 cats = json.loads(r["categories"]) if r["categories"] else []
+                raw_ch = json.loads(r["raw_channel_json"]) if r["raw_channel_json"] else {}
+                stats = raw_ch.get("statistics", {})
                 c_url = f"https://www.youtube.com/{r['custom_url']}" if r["custom_url"] else f"https://www.youtube.com/channel/{r['channel_id']}"
+
+                sub_cnt = stats.get("subscriberCount")
+                vid_cnt = stats.get("videoCount")
 
                 rows.append({
                     "상태": r["liveness_status"],
                     "채널명": r["title"],
+                    "구독자수": int(sub_cnt) if sub_cnt and str(sub_cnt).isdigit() else (sub_cnt or "-"),
+                    "전체영상수": int(vid_cnt) if vid_cnt and str(vid_cnt).isdigit() else (vid_cnt or "-"),
                     "채널홈URL": c_url,
                     "카테고리": ", ".join(cats),
                     "최근 업로드일": r["last_upload_at"] or "-",

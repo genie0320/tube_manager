@@ -153,7 +153,7 @@ def run_sync_pipeline(
         chunk = unique_channel_ids[i:i + chunk_size]
         try:
             res = yt_primary.channels().list(
-                part="snippet,topicDetails,contentDetails",
+                part="snippet,topicDetails,contentDetails,statistics",
                 id=",".join(chunk),
                 maxResults=50,
             ).execute()
@@ -254,3 +254,66 @@ def run_sync_pipeline(
 
     _notify(1.0, f"동기화 완료: 총 {total_unique}개 채널의 상태가 최신으로 동기화되었습니다.")
     return total_unique
+
+
+def enrich_existing_channels_with_statistics(
+    client_id: str,
+    client_secret: str,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> int:
+    """
+    Backfills subscriberCount, videoCount, viewCount for channels in DB
+    that do not yet have statistics, in batches of 50 (only 1 unit per 50 channels).
+    """
+    tokens = db.get_all_tokens()
+    if not tokens:
+        raise ValueError("등록된 연동 계정이 없습니다.")
+    yt = get_youtube_service(client_id, client_secret, tokens[0]["refresh_token"])
+
+    records = db.fetch_master_records()
+    if not records:
+        return 0
+
+    target_channels = []
+    for r in records:
+        raw_ch = json.loads(r["raw_channel_json"]) if r["raw_channel_json"] else {}
+        if "statistics" not in raw_ch:
+            target_channels.append((r["channel_id"], raw_ch))
+
+    total_targets = len(target_channels)
+    if total_targets == 0:
+        return 0
+
+    chunk_size = 50
+    updated_count = 0
+    for i in range(0, total_targets, chunk_size):
+        chunk = target_channels[i:i + chunk_size]
+        chunk_ids = [c[0] for c in chunk]
+        if progress_callback:
+            progress_callback(i / total_targets, f"[{i + 1}/{total_targets}] 채널 구독자수/영상수 통계 보강 중...")
+        try:
+            res = yt.channels().list(
+                part="statistics",
+                id=",".join(chunk_ids),
+                maxResults=50,
+            ).execute()
+            db.log_quota(1, f"channels.list statistics enrich ({len(chunk_ids)})")
+            stats_map = {item["id"]: item.get("statistics", {}) for item in res.get("items", [])}
+
+            with db.get_connection() as conn:
+                for c_id, raw_ch in chunk:
+                    if c_id in stats_map:
+                        raw_ch["statistics"] = stats_map[c_id]
+                        conn.execute("""
+                        UPDATE subscriptions_master 
+                        SET raw_channel_json = ?, updated_at = CURRENT_TIMESTAMP 
+                        WHERE channel_id = ?
+                        """, (json.dumps(raw_ch, ensure_ascii=False), c_id))
+                        updated_count += 1
+                conn.commit()
+        except Exception as e:
+            print(f"[Statistics Enrich Error] {str(e)}", flush=True)
+
+    if progress_callback:
+        progress_callback(1.0, f"통계 보강 완료! 총 {updated_count}개 채널의 구독자/영상수 반영됨")
+    return updated_count
