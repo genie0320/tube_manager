@@ -11,8 +11,13 @@ from googleapiclient.discovery import build
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
+import importlib
 import db
 import collector
+
+# Ensure fresh module reloads during development
+importlib.reload(db)
+importlib.reload(collector)
 
 # Page setup
 st.set_page_config(
