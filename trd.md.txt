@@ -1,0 +1,675 @@
+# 기술 요구사항 정의서 (TRD): YouTube 다중 계정 구독 통합 및 수명주기 관리 시스템
+
+## 1. 시스템 아키텍처 및 개요
+
+본 시스템은 다중 구글 계정 및 브랜드 채널에 분산된 YouTube 구독 목록을 단일 저장소로 취합하고, API 원본 데이터를 보존하며, 채널의 최근 활동성을 판정하여 엑셀 추출 및 통합 뷰어를 제공하는 로컬 웹 애플리케이션이다.
+
+```
+[Google OAuth 2.0]
+       │
+       ▼ (Refresh Token 발급)
+┌────────────────────────────────────────────────────────┐
+│ Streamlit Application (app.py)                         │
+│  ├─ 계정/토큰 CRUD UI                                  │
+│  ├─ 동기화 오케스트레이터 (배치 수집 및 Liveness 판정)  │
+│  ├─ 신호등 필터 기반 데이터 그리드 & 상세 모달        │
+│  └─ 엑셀(.xlsx) 내보내기 엔진                          │
+└────────────────────────────────────────────────────────┘
+       │                                     ▲
+       ▼ (API 호출 / 쿼터 추적)              │ (ORM/Query)
+[YouTube Data API v3]               [SQLite Database (app.db)]
+ - subscriptions.list                - oauth_tokens
+ - channels.list (Batch 50)          - subscriptions_master
+ - playlistItems.list (Liveness)     - raw_payloads (JSON)
+
+```
+
+---
+
+## 2. 데이터베이스 스키마 (SQLite DDL)
+
+데이터베이스는 단일 파일(`app.db`)로 구성되며, 정제된 조회용 필드와 함께 디버깅 및 확장을 위한 원본 JSON 페이로드를 별도 텍스트 컬럼에 직렬화하여 저장한다.
+
+```sql
+-- 1. OAuth 인증 토큰 및 연동 채널 관리 테이블
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    channel_id TEXT PRIMARY KEY,          -- 연동 주체 채널 ID (UC...)
+    account_email TEXT NOT NULL,         -- 구글 계정 이메일
+    channel_title TEXT NOT NULL,         -- 연동 주체 채널명
+    refresh_token TEXT NOT NULL,         -- 오프라인 액세스용 토큰
+    access_token TEXT,                   -- 임시 통신 토큰
+    token_expiry TIMESTAMP,              -- 액세스 토큰 만료 시각
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. 단일 진실 공급원(SSOT) 통합 구독 채널 마스터 테이블
+CREATE TABLE IF NOT EXISTS subscriptions_master (
+    channel_id TEXT PRIMARY KEY,          -- 구독 대상 채널 ID (UC...)
+    title TEXT NOT NULL,                  -- 채널명
+    description TEXT,                    -- 채널 설명
+    custom_url TEXT,                     -- 커스텀 핸들/URL (@handle)
+    thumbnail_url TEXT,                  -- 채널 대표 썸네일 URL
+    categories TEXT,                     -- JSON 배열 형태의 카테고리 태그 (["Tech", ...])
+    uploads_playlist_id TEXT,            -- 업로드 동영상 재생목록 ID (UU...)
+    last_upload_at TIMESTAMP,            -- 가장 최근 영상 게시 일시
+    days_since_last_upload INTEGER,      -- 최근 영상 게시 경과 일수
+    liveness_status TEXT CHECK(liveness_status IN ('GREEN', 'YELLOW', 'RED', 'UNKNOWN')),
+    source_accounts TEXT NOT NULL,       -- 해당 채널을 구독 중인 내 연동 채널 목록 (JSON 배열)
+    recent_videos TEXT,                  -- 최근 영상 3개 메타데이터 (JSON 직렬화)
+    raw_subscription_json TEXT,          -- subscriptions.list 원본 API 응답
+    raw_channel_json TEXT,               -- channels.list 원본 API 응답
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 인덱스 설계
+CREATE INDEX IF NOT EXISTS idx_subs_liveness ON subscriptions_master(liveness_status);
+CREATE INDEX IF NOT EXISTS idx_subs_last_upload ON subscriptions_master(last_upload_at);
+
+```
+
+---
+
+## 3. YouTube Data API v3 파이프라인 및 할당량 모델
+
+### 3.1 단계별 API 호출 시퀀스
+
+| 파이프라인 단계 | 호출 엔드포인트 | 파라미터 및 배치 전략 | 쿼터 소모량 |
+| --- | --- | --- | --- |
+| **1단계: 구독 목록 수집** | `subscriptions.list` | `mine=True`, `part="snippet"`, `maxResults=50` (Pagination) | 호출당 1 유닛 (50개당 1) |
+| **2단계: 채널 상세/주제** | `channels.list` | `id="id1,id2...id50"`, `part="snippet,topicDetails,contentDetails"` | 50개 묶음당 1 유닛 |
+| **3단계: 최근 영상 3개** | `playlistItems.list` | `playlistId={uploads_playlist_id}`, `part="snippet"`, `maxResults=3` | 채널당 1 유닛 |
+
+### 3.2 할당량(Quota) 시뮬레이션 (구독 채널 400개 기준)
+
+* **Step 1:** 400개 $\div$ 50 = 8회 호출 $\rightarrow$ **8 유닛**
+* **Step 2:** 중복 제거 후 고유 채널 350개 가정 $\rightarrow$ 350 $\div$ 50 = 7회 호출 $\rightarrow$ **7 유닛**
+* **Step 3:** 350개 고유 채널의 최근 영상 수집 $\rightarrow$ 350회 호출 $\rightarrow$ **350 유닛**
+* **총 소모량:** 약 **365 유닛** (일일 무료 제공량 10,000 유닛의 약 3.65%로 매우 안전함)
+
+---
+
+## 4. 비즈니스 로직 및 신호등(Liveness) 판정 규칙
+
+동기화 실행 시점(기준일: `current_time`)과 채널의 가장 최신 영상 업로드일(`last_upload_at`) 간의 일수 차이(`$\Delta days$`)를 계산해 상태를 부여한다.
+
+$$\Delta days = \lfloor (\text{current\_time} - \text{last\_upload\_at}).\text{total\_seconds}() / 86400 \rfloor$$
+
+* **초록불 (`GREEN`):** $\Delta days \le 90$ (최근 3개월 이내 업로드 확인된 활성 채널)
+* **노란불 (`YELLOW`):** $90 < \Delta days \le 180$ (최근 3~6개월간 업로드가 정체된 채널)
+* **빨간불 (`RED`):** $\Delta days > 180$ (6개월 이상 영상이 없는 사실상의 휴면 채널 $\rightarrow$ 정리 우선 대상)
+* **알 수 없음 (`UNKNOWN`):** 채널에 업로드된 영상이 단 1개도 없는 채널
+
+---
+
+## 5. UI/UX 및 기능 명세 (Streamlit 기반)
+
+화면은 사이드바와 4개의 메인 탭으로 분할 구성한다.
+
+### 5.1 사이드바 (Sidebar)
+
+* **API Client 설정:** Google OAuth `Client ID` 및 `Client Secret` 입력 폼 (`st.session_state` 및 환경변수/로컬 파일 저장 지원).
+* **Quota 모니터링:** 당일 실행된 API 호출 누적 유닛 추적 게이지.
+
+### 5.2 탭 1: 연동 계정 관리 (Account Manager)
+
+* **연동 현황 테이블:** DB(`oauth_tokens`)에 저장된 계정 이메일, 채널명, 채널 ID, 등록일자 표시.
+* **계정 추가 (OAuth 2.0 Auth Code Flow):**
+* '신규 채널 연동' 버튼 클릭 시 Google 로그인 URL 생성.
+* 구글 로그인 및 채널 선택 후 리다이렉트된 인증 코드(`code`)를 입력받아 `Refresh Token` 획득 후 DB에 Upsert.
+
+
+* **삭제 기능:** 특정 채널 연동 해제 버튼 (`DELETE FROM oauth_tokens WHERE channel_id = ?`).
+
+### 5.3 탭 2: 데이터 수집 및 동기화 (Sync Runner)
+
+* **[전체 동기화 실행] 버튼:**
+1. 등록된 모든 토큰 순회하며 구독 목록 수집 $\rightarrow$ 중복 채널 제거.
+2. 고유 채널들에 대해 `channels.list` 50개 배치 실행.
+3. `playlistItems.list` 순차 호출 (Rate Limit 방지를 위해 각 호출 간 0.05초 간격 부여).
+4. 상태 코드 판정 후 DB 저장 (`raw_payloads` 포함).
+
+
+* **프로그레스 바:** `st.progress`를 통해 'N / Total 채널 처리 중...' 표시.
+
+### 5.4 탭 3: 통합 구독 관리 대시보드
+
+* **지표 카드 (Metrics):** 전체 채널 수, 초록불 수, 노란불 수, 빨간불 수 표기.
+* **다중 필터 컨트롤:**
+* 상태 필터 멀티 셀렉트: `[GREEN, YELLOW, RED]`
+* 채널명 검색 입력창.
+
+
+* **데이터 그리드 (`st.dataframe`):**
+* 컬럼: 상태(배지/색상), 채널명, 카테고리 태그, 최근 업로드일자, 경과 일수, 구독 소속 계정.
+
+
+* **상세보기 익스팬더/모달 (On-Demand):**
+* 그리드에서 선택한 채널의 정보 노출.
+* 최근 영상 3개 카드 뷰: 썸네일 이미지, 영상 제목, 업로드 시각, 유튜브 바로가기 링크.
+* 하단 아코디언: 저장된 `raw_subscription_json` 및 `raw_channel_json` 코드 뷰어.
+
+
+
+### 5.5 탭 4: 엑셀 내보내기 (Export)
+
+* 필터링된 데이터셋 또는 전체 마스터 DB를 `.xlsx` 파일로 변환하여 다운로드하는 버튼 제공.
+
+---
+
+## 6. 엑셀 파일 내보내기 명세
+
+엑셀 시트는 사용자가 한눈에 상태를 판별할 수 있도록 구성하며, 헤더와 서식을 정형화한다.
+
+| 컬럼 순서 | 컬럼명 | 데이터 원천 및 가공 규칙 | 예시 데이터 |
+| --- | --- | --- | --- |
+| **A** | 상태 | `liveness_status` (조건부 서식: GREEN-초록, YELLOW-노랑, RED-빨강) | GREEN |
+| **B** | 채널명 | `title` | 테크노트 |
+| **C** | 채널 핸들/URL | `[https://www.youtube.com/](https://www.youtube.com/){custom_url}` 또는 채널 기본 URL | [https://www.youtube.com/@technote](https://www.google.com/search?q=https://www.youtube.com/%40technote) |
+| **D** | 카테고리 | `categories` 배열을 쉼표로 연결 | Technology, Science |
+| **E** | 최근 업로드일 | `last_upload_at` (`YYYY-MM-DD` 포맷) | 2026-09-15 |
+| **F** | 미업로드 일수 | `days_since_last_upload` | 15일 전 |
+| **G** | 구독 계정 출처 | `source_accounts` 배열을 쉼표로 연결 | 테크 서브채널, 개인 메인 |
+| **H** | 최근 영상 1 제목 | `recent_videos[0].title` | 2026년 파이썬 아키텍처 개편 |
+| **I** | 최근 영상 2 제목 | `recent_videos[1].title` | SQLite와 로컬 데이터 관리 |
+| **J** | 최근 영상 3 제목 | `recent_videos[2].title` | YouTube Data API 완전 정복 |
+| **K** | 채널 설명 | `description` (줄바꿈 공백 치환) | 기술 튜토리얼을 다루는 채널입니다. |
+
+---
+
+## 7. 실행 코드 청사진 (Core Code Implementation)
+
+시스템은 `db.py`, `collector.py`, `app.py` 3개 모듈로 명확히 분리하여 구현한다.
+
+### 7.1 데이터베이스 모듈 (`db.py`)
+
+```python
+import json
+import sqlite3
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+DB_FILE = "app.db"
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS oauth_tokens (
+        channel_id TEXT PRIMARY KEY,
+        account_email TEXT NOT NULL,
+        channel_title TEXT NOT NULL,
+        refresh_token TEXT NOT NULL,
+        access_token TEXT,
+        token_expiry TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS subscriptions_master (
+        channel_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT,
+        custom_url TEXT,
+        thumbnail_url TEXT,
+        categories TEXT,
+        uploads_playlist_id TEXT,
+        last_upload_at TIMESTAMP,
+        days_since_last_upload INTEGER,
+        liveness_status TEXT,
+        source_accounts TEXT NOT NULL,
+        recent_videos TEXT,
+        raw_subscription_json TEXT,
+        raw_channel_json TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+def upsert_token(channel_id: str, email: str, title: str, refresh_token: str, access_token: str, expiry: Optional[datetime]):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO oauth_tokens (channel_id, account_email, channel_title, refresh_token, access_token, token_expiry, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(channel_id) DO UPDATE SET
+        account_email=excluded.account_email,
+        channel_title=excluded.channel_title,
+        refresh_token=excluded.refresh_token,
+        access_token=excluded.access_token,
+        token_expiry=excluded.token_expiry,
+        updated_at=CURRENT_TIMESTAMP;
+    """, (channel_id, email, title, refresh_token, access_token, expiry))
+    conn.commit()
+    conn.close()
+
+def get_all_tokens() -> List[sqlite3.Row]:
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM oauth_tokens ORDER ON created_at ASC").fetchall()
+    conn.close()
+    return rows
+
+def delete_token(channel_id: str):
+    conn = get_connection()
+    conn.execute("DELETE FROM oauth_tokens WHERE channel_id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
+
+def upsert_subscription_record(record: Dict[str, Any]):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO subscriptions_master (
+        channel_id, title, description, custom_url, thumbnail_url,
+        categories, uploads_playlist_id, last_upload_at, days_since_last_upload,
+        liveness_status, source_accounts, recent_videos, raw_subscription_json,
+        raw_channel_json, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(channel_id) DO UPDATE SET
+        title=excluded.title,
+        description=excluded.description,
+        custom_url=excluded.custom_url,
+        thumbnail_url=excluded.thumbnail_url,
+        categories=excluded.categories,
+        uploads_playlist_id=excluded.uploads_playlist_id,
+        last_upload_at=excluded.last_upload_at,
+        days_since_last_upload=excluded.days_since_last_upload,
+        liveness_status=excluded.liveness_status,
+        source_accounts=excluded.source_accounts,
+        recent_videos=excluded.recent_videos,
+        raw_subscription_json=excluded.raw_subscription_json,
+        raw_channel_json=excluded.raw_channel_json,
+        updated_at=CURRENT_TIMESTAMP;
+    """, (
+        record["channel_id"], record["title"], record["description"],
+        record["custom_url"], record["thumbnail_url"], json.dumps(record["categories"], ensure_ascii=False),
+        record["uploads_playlist_id"], record["last_upload_at"], record["days_since_last_upload"],
+        record["liveness_status"], json.dumps(record["source_accounts"], ensure_ascii=False),
+        json.dumps(record["recent_videos"], ensure_ascii=False),
+        json.dumps(record["raw_subscription_json"], ensure_ascii=False),
+        json.dumps(record["raw_channel_json"], ensure_ascii=False)
+    ))
+    conn.commit()
+    conn.close()
+
+def fetch_master_records() -> List[sqlite3.Row]:
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM subscriptions_master ORDER BY days_since_last_upload ASC").fetchall()
+    conn.close()
+    return rows
+
+```
+
+### 7.2 API 수집 파이프라인 엔진 (`collector.py`)
+
+```python
+import json
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+import db
+
+SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
+
+def get_youtube_service(client_id: str, client_secret: str, refresh_token: str):
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=SCOPES
+    )
+    return build("youtube", "v3", credentials=creds)
+
+def fetch_all_subscriptions_for_token(youtube, source_channel_name: str) -> Dict[str, Dict[str, Any]]:
+    channel_map = {}
+    next_page_token = None
+    while True:
+        res = youtube.subscriptions().list(
+            part="snippet",
+            mine=True,
+            maxResults=50,
+            pageToken=next_page_token
+        ).execute()
+        
+        for item in res.get("items", []):
+            c_id = item["snippet"]["resourceId"]["channelId"]
+            if c_id not in channel_map:
+                channel_map[c_id] = {
+                    "channel_id": c_id,
+                    "title": item["snippet"]["title"],
+                    "description": item["snippet"]["description"],
+                    "thumbnail_url": item["snippet"]["thumbnails"].get("high", {}).get("url", ""),
+                    "source_accounts": [source_channel_name],
+                    "raw_subscription_json": item
+                }
+            else:
+                if source_channel_name not in channel_map[c_id]["source_accounts"]:
+                    channel_map[c_id]["source_accounts"].append(source_channel_name)
+                    
+        next_page_token = res.get("nextPageToken")
+        if not next_page_token:
+            break
+    return channel_map
+
+def run_sync_pipeline(client_id: str, client_secret: str, progress_callback: Callable[[float, str], None]):
+    tokens = db.get_all_tokens()
+    if not tokens:
+        raise ValueError("등록된 OAuth 계정/채널이 없습니다.")
+
+    merged_subscriptions: Dict[str, Dict[str, Any]] = {}
+
+    # Step 1: 모든 연동 계정의 구독 목록 취합 및 중복 병합
+    for idx, token in enumerate(tokens):
+        progress_callback((idx / len(tokens)) * 0.3, f"{token['channel_title']} 구독 목록 수집 중...")
+        yt = get_youtube_service(client_id, client_secret, token["refresh_token"])
+        subs = fetch_all_subscriptions_for_token(yt, token["channel_title"])
+        for c_id, data in subs.items():
+            if c_id in merged_subscriptions:
+                for src in data["source_accounts"]:
+                    if src not in merged_subscriptions[c_id]["source_accounts"]:
+                        merged_subscriptions[c_id]["source_accounts"].append(src)
+            else:
+                merged_subscriptions[c_id] = data
+
+    unique_channel_ids = list(merged_subscriptions.keys())
+    total_unique = len(unique_channel_ids)
+    if total_unique == 0:
+        return
+
+    # 서비스 인스턴스 (첫 번째 활성 토큰 재사용)
+    yt_primary = get_youtube_service(client_id, client_secret, tokens[0]["refresh_token"])
+
+    # Step 2: 채널 상세 정보 50개 단위 배치 수집
+    channels_meta = {}
+    chunk_size = 50
+    for i in range(0, total_unique, chunk_size):
+        chunk = unique_channel_ids[i:i + chunk_size]
+        res = yt_primary.channels().list(
+            part="snippet,topicDetails,contentDetails",
+            id=",".join(chunk),
+            maxResults=50
+        ).execute()
+        for ch_item in res.get("items", []):
+            channels_meta[ch_item["id"]] = ch_item
+
+    # Step 3: 최신 영상 3개 조회 및 Liveness 판정
+    now = datetime.now(timezone.utc)
+    for idx, c_id in enumerate(unique_channel_ids):
+        progress_callback(0.4 + (idx / total_unique) * 0.6, f"[{idx+1}/{total_unique}] 채널 활동 상태 분석 중...")
+        sub_info = merged_subscriptions[c_id]
+        ch_info = channels_meta.get(c_id, {})
+        
+        # 기본 메타 추출
+        snippet = ch_info.get("snippet", {})
+        custom_url = snippet.get("customUrl", "")
+        topic_urls = ch_info.get("topicDetails", {}).get("topicCategories", [])
+        categories = [url.split("/")[-1].replace("_", " ") for url in topic_urls]
+        uploads_id = ch_info.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+        if not uploads_id and c_id.startswith("UC"):
+            uploads_id = "UU" + c_id[2:]
+
+        # 최근 3개 영상 조회
+        recent_videos = []
+        last_upload_at = None
+        days_since = None
+        liveness_status = "UNKNOWN"
+
+        if uploads_id:
+            try:
+                p_res = yt_primary.playlistItems().list(
+                    part="snippet",
+                    playlistId=uploads_id,
+                    maxResults=3
+                ).execute()
+                for item in p_res.get("items", []):
+                    p_snippet = item["snippet"]
+                    v_id = p_snippet.get("resourceId", {}).get("videoId")
+                    v_published = p_snippet.get("publishedAt")
+                    recent_videos.append({
+                        "video_id": v_id,
+                        "title": p_snippet.get("title"),
+                        "video_url": f"https://www.youtube.com/watch?v={v_id}",
+                        "thumbnail_url": p_snippet.get("thumbnails", {}).get("high", {}).get("url", ""),
+                        "published_at": v_published
+                    })
+                if recent_videos:
+                    last_date_str = recent_videos[0]["published_at"]
+                    last_dt = datetime.fromisoformat(last_date_str.replace("Z", "+00:00"))
+                    last_upload_at = last_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    days_since = (now - last_dt).days
+                    if days_since <= 90:
+                        liveness_status = "GREEN"
+                    elif days_since <= 180:
+                        liveness_status = "YELLOW"
+                    else:
+                        liveness_status = "RED"
+            except Exception:
+                pass
+            time.sleep(0.05)  # API 방어용 지연
+
+        # DB 레코드 조립
+        record = {
+            "channel_id": c_id,
+            "title": sub_info["title"],
+            "description": snippet.get("description", sub_info["description"]),
+            "custom_url": custom_url,
+            "thumbnail_url": snippet.get("thumbnails", {}).get("high", {}).get("url", sub_info["thumbnail_url"]),
+            "categories": categories,
+            "uploads_playlist_id": uploads_id,
+            "last_upload_at": last_upload_at,
+            "days_since_last_upload": days_since,
+            "liveness_status": liveness_status,
+            "source_accounts": sub_info["source_accounts"],
+            "recent_videos": recent_videos,
+            "raw_subscription_json": sub_info["raw_subscription_json"],
+            "raw_channel_json": ch_info
+        }
+        db.upsert_subscription_record(record)
+
+```
+
+### 7.3 Streamlit 대시보드 UI (`app.py`)
+
+```python
+import io
+import json
+import pandas as pd
+import streamlit as st
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+import db
+import collector
+
+st.set_page_config(page_title="YouTube Subscription SSOT Manager", layout="wide")
+db.init_db()
+
+# --- 사이드바: OAuth Client 설정 ---
+st.sidebar.title("설정 (Configuration)")
+client_id = st.sidebar.text_input("Google Client ID", type="password")
+client_secret = st.sidebar.text_input("Google Client Secret", type="password")
+redirect_uri = "urn:ietf:wg:oauth:2.0:oob"  # 로컬 수동 코드 복사 방식
+
+tab_manage, tab_sync, tab_view, tab_export = st.tabs([
+    "1. 연동 계정 관리", "2. 수집 및 동기화", "3. 구독 목록 대시보드", "4. 엑셀 내보내기"
+])
+
+# --- TAB 1: 연동 계정 CRUD ---
+with tab_manage:
+    st.subheader("연동된 YouTube 채널 목록")
+    tokens = db.get_all_tokens()
+    if tokens:
+        for t in tokens:
+            col1, col2, col3 = st.columns([3, 2, 1])
+            col1.write(f"**{t['channel_title']}** ({t['account_email']})")
+            col2.code(t["channel_id"])
+            if col3.button("연결 해제", key=f"del_{t['channel_id']}"):
+                db.delete_token(t["channel_id"])
+                st.rerun()
+    else:
+        st.info("등록된 계정이 없습니다. 아래에서 신규 채널을 연동하세요.")
+
+    st.divider()
+    st.subheader("신규 채널 연동 (OAuth 2.0)")
+    if client_id and client_secret:
+        flow = Flow.from_client_config(
+            {
+                "installed": {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [redirect_uri],
+                }
+            },
+            scopes=collector.SCOPES,
+            redirect_uri=redirect_uri
+        )
+        auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+        st.markdown(f"[👉 여기를 클릭하여 구글 로그인 및 채널 선택 진행]({auth_url})")
+        auth_code = st.text_input("인증 완료 후 화면에 표시된 Code를 붙여넣으세요:")
+        if st.button("연동 등록 완료"):
+            if auth_code:
+                flow.fetch_token(code=auth_code)
+                creds = flow.credentials
+                # 본인 채널 프로필 조회
+                yt = build("youtube", "v3", credentials=creds)
+                my_ch = yt.channels().list(part="snippet", mine=True).execute()["items"][0]
+                db.upsert_token(
+                    channel_id=my_ch["id"],
+                    email="Linked Account",
+                    title=my_ch["snippet"]["title"],
+                    refresh_token=creds.refresh_token,
+                    access_token=creds.token,
+                    expiry=creds.expiry
+                )
+                st.success(f"채널 '{my_ch['snippet']['title']}' 연동 성공!")
+                st.rerun()
+    else:
+        st.warning("사이드바에 Client ID와 Client Secret을 먼저 입력해 주세요.")
+
+# --- TAB 2: 동기화 실행 ---
+with tab_sync:
+    st.subheader("데이터 동기화 오케스트레이터")
+    st.write("모든 연동 계정의 구독 목록을 조회하여 중복을 제거하고 최신 3개 영상 기반 Liveness를 판정합니다.")
+    if st.button("동기화 파이프라인 실행", type="primary"):
+        if not client_id or not client_secret:
+            st.error("Client ID 및 Secret 설정이 필요합니다.")
+        else:
+            prog_bar = st.progress(0.0)
+            status_text = st.empty()
+            try:
+                collector.run_sync_pipeline(
+                    client_id, client_secret,
+                    lambda p, msg: (prog_bar.progress(p), status_text.text(msg))
+                )
+                prog_bar.progress(1.0)
+                status_text.success("동기화가 완료되었습니다.")
+            except Exception as e:
+                status_text.error(f"동기화 실패: {str(e)}")
+
+# --- TAB 3: 대시보드 뷰어 ---
+with tab_view:
+    records = db.fetch_master_records()
+    if not records:
+        st.info("데이터가 없습니다. 먼저 동기화를 실행하세요.")
+    else:
+        df = pd.DataFrame([dict(r) for r in records])
+        
+        # 메트릭 표시
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("총 구독 채널", len(df))
+        c2.metric("🟢 활성 (3개월 이내)", len(df[df["liveness_status"] == "GREEN"]))
+        c3.metric("🟡 정체 (3~6개월)", len(df[df["liveness_status"] == "YELLOW"]))
+        c4.metric("🔴 휴면 (6개월 이상)", len(df[df["liveness_status"] == "RED"]))
+
+        # 필터링
+        col_f1, col_f2 = st.columns([1, 2])
+        status_filter = col_f1.multiselect("신호등 필터", ["GREEN", "YELLOW", "RED", "UNKNOWN"], default=["GREEN", "YELLOW", "RED"])
+        search_kw = col_f2.text_input("채널명 검색")
+
+        filtered_df = df[df["liveness_status"].isin(status_filter)]
+        if search_kw:
+            filtered_df = filtered_df[filtered_df["title"].str.contains(search_kw, case=False, na=False)]
+
+        st.dataframe(
+            filtered_df[["liveness_status", "title", "days_since_last_upload", "last_upload_at", "categories", "source_accounts"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.divider()
+        st.subheader("채널 상세 및 최근 영상 확인")
+        selected_title = st.selectbox("상세 정보를 확인할 채널을 선택하세요:", filtered_df["title"].tolist() if not filtered_df.empty else [])
+        if selected_title:
+            row = filtered_df[filtered_df["title"] == selected_title].iloc[0]
+            v_cols = st.columns(3)
+            recent_vids = json.loads(row["recent_videos"]) if row["recent_videos"] else []
+            for v_idx, v in enumerate(recent_videos[:3]):
+                with v_cols[v_idx]:
+                    if v.get("thumbnail_url"):
+                        st.image(v["thumbnail_url"])
+                    st.markdown(f"**[{v.get('title')}]({v.get('video_url')})**")
+                    st.caption(f"게시일: {v.get('published_at')[:10]}")
+
+            with st.expander("API 원본 JSON 페이로드 검사"):
+                st.json({
+                    "raw_subscription": json.loads(row["raw_subscription_json"]) if row["raw_subscription_json"] else {},
+                    "raw_channel": json.loads(row["raw_channel_json"]) if row["raw_channel_json"] else {}
+                })
+
+# --- TAB 4: 엑셀 내보내기 ---
+with tab_export:
+    st.subheader("엑셀 파일 추출")
+    records = db.fetch_master_records()
+    if records:
+        export_rows = []
+        for r in records:
+            vids = json.loads(r["recent_videos"]) if r["recent_videos"] else []
+            sources = json.loads(r["source_accounts"]) if r["source_accounts"] else []
+            cats = json.loads(r["categories"]) if r["categories"] else []
+            export_rows.append({
+                "상태": r["liveness_status"],
+                "채널명": r["title"],
+                "채널홈URL": f"https://www.youtube.com/{r['custom_url']}" if r["custom_url"] else f"https://www.youtube.com/channel/{r['channel_id']}",
+                "카테고리": ", ".join(cats),
+                "최근 업로드일": r["last_upload_at"],
+                "경과일수": r["days_since_last_upload"],
+                "구독계정출처": ", ".join(sources),
+                "최근영상1": vids[0]["title"] if len(vids) > 0 else "",
+                "최근영상2": vids[1]["title"] if len(vids) > 1 else "",
+                "최근영상3": vids[2]["title"] if len(vids) > 2 else "",
+                "채널설명": (r["description"] or "").replace("\n", " ")
+            })
+        
+        out_df = pd.DataFrame(export_rows)
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            out_df.to_excel(writer, index=False, sheet_name="Subscriptions_SSOT")
+        
+        st.download_button(
+            label="통합 구독 목록 엑셀(.xlsx) 다운로드",
+            data=buffer.getvalue(),
+            file_name=f"youtube_subscriptions_ssot_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+```
+
+---
+
+## 8. 예외 처리 및 장애 대응 정책
+
+1. **`invalid_grant` (토큰 만료):** 구글 계정 비밀번호 변경 등으로 Refresh Token이 무효화된 경우, 동기화 루프가 중단되지 않도록 `try-except`로 격리하고 해당 계정을 UI상 '재인증 필요' 상태로 마킹한다.
+2. **신규/빈 채널의 업로드 영상 누락:** `uploads_playlist_id`를 조회했으나 동영상이 0개인 경우 `playlistItems.list`가 빈 배열을 반환한다. 이때 크래시를 방지하고 `liveness_status = 'UNKNOWN'`으로 기본 할당한다.
+3. **API 일일 쿼터 초과 (`403 quotaExceeded`):** 구글 서버로부터 할당량 소진 오류가 리턴될 경우 파이프라인을 즉시 안전 종료(`break`)하고, 그때까지 수집되어 `app.db`에 저장된 채널 데이터는 그대로 보존한다.

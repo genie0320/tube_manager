@@ -1,0 +1,178 @@
+# 제품 요구사항 정의서 (PRD): YouTube 구독 자산 통합 및 수명주기 관리자 (TubeSSOT)
+
+---
+
+## 1. 프로덕트 개요 (Product Overview)
+
+### 1.1 배경 및 문제 정의 (Background & Problem)
+
+* **구독 자산의 파편화:** 업무용, 개인용, 스터디용 등 목적에 따라 생성된 다수의 구글 계정 및 브랜드 채널로 인해 구독 채널 목록이 분산되어 전체 구독 자산의 통합 조망이 불가능함.
+* **피드의 노이즈 및 휴면 채널 방치:** 오랜 기간 운영된 계정일수록 업로드가 중단된 '죽은 채널'이나 초기 구독 의도와 다른 콘텐츠로 피벗(Pivot)한 채널이 누적되어 피드 오염을 유발함.
+* **플랫폼 종속성 및 마이그레이션 한계:** 신규 계정으로 구독을 옮기거나 재구성하려 할 때, YouTube 공식 UI는 일괄 내보내기/가져오기를 지원하지 않으며, API를 통한 대량 구독(`subscriptions.insert`)은 일일 쿼터 소모(50유닛/회) 및 봇 탐지 정책으로 인해 실행이 극히 제한됨.
+* **구독 권한과 시청 세션의 분리 필요성:** 구독 피드는 중앙에서 '주소록'처럼 통제하고, 실제 시청은 특정 계정(예: 프리미엄 활성 계정)에서 수행하는 구조적 분리가 요구됨.
+
+### 1.2 프로덕트 비전 및 목적 (Vision & Goals)
+
+분산된 다중 계정의 YouTube 구독 목록을 단 1회의 인증 설정으로 취합하여 단일 진실 공급원(SSOT, Single Source of Truth)을 구축한다. 각 채널의 최근 활동성(Liveness)을 정량화하여 불필요한 채널을 선제적으로 걸러내고, 정제된 구독 자산을 엑셀 형태로 영구 보존하거나 신규 계정으로 안전하게 단계적 이전할 수 있는 독립 워크스페이스를 제공한다.
+
+---
+
+## 2. 타깃 사용자 및 핵심 가치 (Target & Value Proposition)
+
+### 2.1 대상 사용자 (Target Persona)
+
+* 복수의 구글 계정 또는 다수의 브랜드 채널을 장기간 운용해 온 파워 유저
+* 피드 알고리즘에 휘둘리지 않고 본인이 소비할 정보 원천(Source)을 주도적으로 통제·정리하고자 하는 사용자
+* 계정 변경, 보안 이슈, 서드파티 앱 불안정성 등에 구애받지 않는 영구적인 개인 구독 데이터베이스를 소유하고자 하는 사용자
+
+### 2.2 핵심 가치 제안 (Value Proposition)
+
+| 핵심 가치 | 상세 내용 |
+| --- | --- |
+| **중앙 집중형 원장 관리 (SSOT)** | N개의 계정, M개의 브랜드 채널에 흩어진 구독 데이터를 `channel_id` 기준으로 중복 없이 단일 데이터베이스에 통합. |
+| **정량적 수명주기 판정 (Traffic Light)** | 마지막 영상 게시일 기준 3단계 신호등(🟢 활성 / 🟡 정체 / 🔴 휴면) 체계로 정리 대상 채널을 1초 만에 식별. |
+| **극단적 쿼터 효율성** | 공식 API의 재생목록 캐싱 구조(`UU...`)를 활용해 일일 쿼터(10,000 유닛)의 5% 미만으로 수백 개 채널의 상태 완벽 동기화. |
+| **원시 데이터 자산화** | 정제된 데이터 외에 API 응답 원본(Raw JSON)을 영구 보존하여 향후 UI 변경이나 머신러닝 분석에 즉시 재활용 가능. |
+
+---
+
+## 3. 핵심 기능 요구사항 (Functional Requirements)
+
+```
+[TubeSSOT Functional Architecture]
+  ├─ 1. 인증 및 계정 관리 (OAuth Manager)
+  ├─ 2. 수집 및 정제 엔진 (Ingestion & ETL Pipeline)
+  ├─ 3. 수명주기 판정기 (Liveness Decision Engine)
+  ├─ 4. 인터랙티브 대시보드 (Streamlit UI & Modal Inspector)
+  └─ 5. 자산 추출기 (Excel Export Engine)
+
+```
+
+### FR-01: OAuth 2.0 멀티 채널 토큰 통합 관리 (CRUD)
+
+* **단일 클라이언트 체계:** 사용자는 구글 클라우드 콘솔의 OAuth `Client ID` 및 `Client Secret`을 1회만 등록하여 모든 계정 연동의 창구로 활용한다.
+* **브랜드 채널별 개별 세션 등록:** Google Auth Code Flow를 통해 사용자가 특정 브랜드 채널을 선택할 수 있도록 유도하며, 발급된 `Refresh Token`을 로컬 DB에 영구 적재한다.
+* **계정/채널 현황 관리:** 연동된 채널명, 채널 고유 ID, 계정 이메일, 토큰 상태(유효/만료)를 단일 테이블에서 조회하고 개별 연결을 해제(Delete)할 수 있어야 한다.
+
+### FR-02: 중복 제거 및 구독 목록 수집 파이프라인
+
+* **일괄 수집 오케스트레이션:** '동기화 실행' 트리거 시, 활성화된 모든 토큰을 순회하며 `subscriptions.list` API로 구독 채널을 전수 수집한다.
+* **고유 키 기반 병합:** 동일한 채널을 복수의 내 계정에서 교차 구독 중인 경우, `channel_id`를 기준으로 단일 레코드로 병합하되 `source_accounts` 필드에 출처 계정 목록(예: `["개인 메인", "개발 서브"]`)을 배열 형태로 기록한다.
+* **채널 메타데이터 배치 수집:** `channels.list` 엔드포인트를 사용해 고유 채널들을 최대 50개 단위로 묶어 호출(Batch Request)함으로써 채널 설명, 커스텀 URL, 대표 썸네일, `topicCategories`를 수집한다.
+
+### FR-03: 최근 활동성(Liveness) 판정 엔진
+
+* **마지막 업로드 일자 추적:** 각 채널의 업로드 전용 재생목록(`UU` + `channel_id[2:]`)을 대상으로 `playlistItems.list(maxResults=3)`을 조회하여 최신 영상 등록 일시(`last_upload_at`)를 추출한다.
+* **신호등 상태 자동 태깅:** 동기화 기준 시점과 `last_upload_at` 간의 일수 차이($\Delta days$)에 따라 4단계 상태를 부여한다.
+* 🟢 **GREEN (활성):** $\Delta days \le 90$ (최근 3개월 이내 업로드 확인)
+* 🟡 **YELLOW (정체):** $90 < \Delta days \le 180$ (3~6개월간 업로드 정체)
+* 🔴 **RED (휴면):** $\Delta days > 180$ (6개월 이상 방치된 채널 $\rightarrow$ 정리 최우선 권고)
+* ⚪ **UNKNOWN (미확인):** 채널에 게시된 영상이 0개인 경우
+
+
+
+### FR-04: 온디맨드(On-Demand) 상세 뷰어 및 필터링
+
+* **신호등 다중 필터:** 대시보드 상단에서 상태별(🟢, 🟡, 🔴) 토글 필터와 채널명/카테고리 실시간 검색 기능을 제공한다.
+* **지연 로딩 기반 상세 검사:** 목록 화면에서는 텍스트 메타데이터만 빠르게 렌더링하고, 사용자가 특정 채널을 선택(클릭)했을 때에만 해당 채널의 최근 영상 3개(썸네일 이미지, 제목, 게시일자, YouTube 직행 링크)를 모달 또는 전용 카드 영역에 노출한다.
+* **구독 직행 링크 제공:** 정리 완료 후 신규 계정으로 구독을 진행할 수 있도록 채널 바로가기 URL(`[https://www.youtube.com/channel/](https://www.youtube.com/channel/){channel_id}`) 및 자동 구독 팝업 URL(`?sub_confirmation=1`)을 제공한다.
+
+### FR-05: 원시 데이터(Raw Payload) 아카이빙
+
+* API 통신 과정에서 수신한 `subscriptions.list` 및 `channels.list`의 원본 JSON 응답 전문을 정제 테이블 내 `raw_subscription_json`, `raw_channel_json` 컬럼에 문자열로 직렬화하여 함께 저장한다.
+* 사용자는 UI 내 'API 원본 JSON 검사' 익스팬더를 통해 가공되지 않은 YouTube의 전체 스키마 데이터를 상시 열람할 수 있어야 한다.
+
+### FR-06: 엑셀(.xlsx) 리포트 빌더
+
+* DB에 적재된 마스터 데이터를 사용자가 지정한 필터 조건에 맞춰 엑셀 파일로 컴파일 및 다운로드한다.
+* 포함 필드: 상태, 채널명, 채널 홈 URL, 카테고리, 최근 업로드일, 경과일수, 구독 출처 계정 목록, 최근 영상 1~3 제목, 채널 설명.
+
+---
+
+## 4. 비기능 요구사항 (Non-Functional Requirements)
+
+| 분류 | 요구사항 명세 |
+| --- | --- |
+| **API 쿼터 최적화** | 채널 500개 기준 전체 동기화 파이프라인의 API Quota 소모량을 **500 유닛 이하(일일 무료 할당량의 5% 미만)**로 유지할 것. (`search.list` 절대 사용 금지) |
+| **데이터 독립성** | 클라우드 DB 연동 없이 로컬 단일 파일인 **SQLite(`app.db`)**로 완결되어야 하며, 파일 복사만으로 백업 및 복구가 가능해야 함. |
+| **보안 및 프라이버시** | 모든 인증 토큰 및 구독 데이터는 **로컬 환경(Localhost) 외부로 전송되지 않아야 함.** 민감 정보인 `Client Secret`과 `Refresh Token`은 로컬 스토리지에만 머물러야 함. |
+| **안정성 (Fault Tolerance)** | 개별 채널 조회 중 `404 Not Found`, 영상 비공개, 채널 삭제 등의 예외 발생 시 전체 수집 루프가 중단되지 않고 해당 채널만 `UNKNOWN` 처리 후 다음 루프로 넘어가야 함. |
+| **레이턴시 및 렌더링 부하** | 수백 개 채널 목록의 썸네일을 한 번에 로드하지 않고 브라우저 메모리 부하를 줄이기 위해 On-Demand 렌더링 방식을 엄수할 것. |
+
+---
+
+## 5. 사용자 시나리오 (User Journey)
+
+```
+[Step 1: 환경 설정]
+사용자가 구글 클라우드 콘솔에서 발급받은 OAuth Client ID / Secret을 대시보드 사이드바에 입력
+
+[Step 2: 멀티 채널 연동]
+대시보드의 '채널 연동' 버튼 클릭 → 브라우저에서 Google 로그인 및 브랜드 채널 선택 → 발급된 코드를 입력하여 7개 채널 순차 등록
+
+[Step 3: 원클릭 동기화]
+'전체 동기화 실행' 클릭 → 백그라운드에서 구독 목록 수집, 중복 제거, Liveness 판정, 원본 JSON 저장이 순차 실행 (진행률 표시)
+
+[Step 4: 상태 기반 큐레이션]
+대시보드에서 🔴(휴면) 필터를 걸어 6개월 이상 방치된 채널들을 일괄 확인하고 제외 대상으로 분류
+애매한 채널은 행을 클릭하여 최근 3개 영상 썸네일과 주제를 확인 후 존속 여부 결정
+
+[Step 5: 자산 내보내기 및 이전]
+정제된 최종 채널 목록을 엑셀로 다운로드하여 개인 로컬 자산으로 아카이빙하고, 신규 계정에서 링크를 통해 일일 30개씩 분할 구독 실행
+
+```
+
+---
+
+## 6. 데이터 스키마 및 인터페이스 정의
+
+### 6.1 핵심 데이터 구조 (Subscriptions Master)
+
+```json
+{
+  "channel_id": "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+  "title": "Google for Developers",
+  "description": "The official YouTube channel for Google developers...",
+  "custom_url": "@GoogleDevelopers",
+  "thumbnail_url": "https://yt3.ggpht.com/ytc/...",
+  "categories": ["Technology", "Software"],
+  "uploads_playlist_id": "UU_x5XG1OV2P6uZZ5FSM9Ttw",
+  "last_upload_at": "2026-09-25 14:00:00",
+  "days_since_last_upload": 5,
+  "liveness_status": "GREEN",
+  "source_accounts": ["테크 서브채널", "개인 메인"],
+  "recent_videos": [
+    {
+      "video_id": "dQw4w9WgXcQ",
+      "title": "New Gemini Tools Release",
+      "video_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "thumbnail_url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+      "published_at": "2026-09-25T14:00:00Z"
+    }
+  ],
+  "raw_subscription_json": "{ ... }",
+  "raw_channel_json": "{ ... }"
+}
+
+```
+
+---
+
+## 7. 릴리즈 단계 및 마일스톤 (Milestones)
+
+* **Phase 1: 데이터 파이프라인 및 백엔드 완결 (MVP)**
+* SQLite 단일 스키마 구축 (`oauth_tokens`, `subscriptions_master`).
+* OAuth 2.0 Auth Code Flow 연동 및 다중 `Refresh Token` 적재 로직 완성.
+* `collector.py` 파이프라인: `subscriptions` 수집 $\rightarrow$ `channels` 배치(50) $\rightarrow$ `playlistItems` Liveness 계산 및 Raw JSON 저장.
+
+
+* **Phase 2: Streamlit 관리 콘솔 및 대시보드 구축**
+* 토큰 CRUD 관리 탭 및 동기화 진행 상태 바 구현.
+* 신호등 필터 기반 데이터 그리드 및 온디맨드 3영상 모달 뷰어 구성.
+* OpenPyXL 기반 맞춤형 서식 엑셀 다운로드 기능 탑재.
+
+
+* **Phase 3: 마이그레이션 워크플로 고도화 (Next Feature)**
+* 대시보드 내에서 '신규 계정 구독 큐(Queue)' 생성 기능.
+* 하루 30개 단위 브라우저 탭 일괄 오픈(`window.open`) 헬퍼 스크립트 추가.
+* 채널 태그/카테고리 수동 편집 및 사용자 정의 메모 기능 지원.
