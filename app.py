@@ -97,12 +97,31 @@ st.sidebar.caption(
 )
 
 st.sidebar.divider()
+
+# Connected channels in sidebar
+tokens = db.get_all_tokens()
+st.sidebar.markdown("### 🔗 연동된 YouTube 채널")
+if tokens:
+    st.sidebar.caption(f"총 **{len(tokens)}개** 채널 연동됨")
+    for t in tokens:
+        st.sidebar.success(f"📺 **{t['channel_title']}**\n\n`{t['channel_id']}`")
+else:
+    st.sidebar.warning("⚠️ 연동된 채널이 없습니다.\n\n'1. 연동 계정 관리' 탭에서 먼저 계정을 연동해 주세요.")
+
+st.sidebar.divider()
 st.sidebar.info("💡 **TubeSSOT v1.0**\n단일 진실 공급원(SSOT) 기반 YouTube 구독 자산 및 수명주기 관리자")
 
 
 # --- OAuth Callback Handler (Redirect from Google) ---
+if "error" in st.query_params:
+    oauth_err = st.query_params.get("error")
+    st.session_state["oauth_status"] = ("error", f"Google 인증이 취소되었거나 오류가 발생했습니다: {oauth_err}")
+    st.query_params.clear()
+    st.rerun()
+
 if "code" in st.query_params and client_id and client_secret:
     auth_code = st.query_params["code"]
+    print(f"[OAuth Callback] Received auth code, exchanging for tokens...", flush=True)
     with st.spinner("Google 계정 인증 정보를 등록하는 중입니다..."):
         try:
             client_config = {
@@ -111,40 +130,77 @@ if "code" in st.query_params and client_id and client_secret:
                     "client_secret": client_secret,
                     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                     "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": ["http://localhost:8501/", "http://localhost:8080/"],
+                    "redirect_uris": ["http://localhost:8501/", "http://localhost:8501", "http://localhost:8080/"],
                 }
             }
-            flow = Flow.from_client_config(
-                client_config,
-                scopes=collector.SCOPES,
-                redirect_uri="http://localhost:8501/",
-            )
-            flow.fetch_token(code=auth_code)
-            creds = flow.credentials
+            # Attempt exchange with http://localhost:8501/
+            flow = None
+            for r_uri in ["http://localhost:8501/", "http://localhost:8501"]:
+                try:
+                    flow = Flow.from_client_config(
+                        client_config,
+                        scopes=collector.SCOPES,
+                        redirect_uri=r_uri,
+                    )
+                    flow.autogenerate_code_verifier = False
+                    flow.fetch_token(code=auth_code)
+                    break
+                except Exception as ex_token:
+                    print(f"[OAuth Callback] Fetch token with {r_uri} failed: {ex_token}", flush=True)
 
+            if not flow or not flow.credentials:
+                raise RuntimeError("Google 서버로부터 토큰을 획득하지 못했습니다.")
+
+            creds = flow.credentials
             yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
             my_channels = yt.channels().list(part="snippet", mine=True).execute()
-            if not my_channels.get("items"):
-                st.error("선택한 계정에서 YouTube 채널 정보를 찾을 수 없습니다. YouTube 채널이 개설되어 있는지 확인해 주세요.")
-            else:
+
+            if my_channels.get("items"):
                 ch_info = my_channels["items"][0]
                 c_id = ch_info["id"]
                 c_title = ch_info["snippet"]["title"]
+            else:
+                # Fallback: Google Account without dedicated YouTube channel
+                c_id = f"user_{creds.client_id[:12]}"
+                c_title = "Google Linked Account (기본 계정)"
 
-                db.upsert_token(
-                    channel_id=c_id,
-                    email="Linked Google Account",
-                    title=c_title,
-                    refresh_token=creds.refresh_token,
-                    access_token=creds.token,
-                    expiry=creds.expiry,
-                )
-                st.success(f"🎉 채널 '{c_title}' ({c_id}) 연동이 성공적으로 등록되었습니다!")
-                st.balloons()
+            db.upsert_token(
+                channel_id=c_id,
+                email="Linked Google Account",
+                title=c_title,
+                refresh_token=creds.refresh_token,
+                access_token=creds.token,
+                expiry=creds.expiry,
+            )
+            print(f"[OAuth Callback] Successfully linked channel: {c_title} ({c_id})", flush=True)
+            st.session_state["oauth_status"] = ("success", f"🎉 채널 **'{c_title}'** ({c_id}) 연동이 성공적으로 등록되었습니다!")
         except Exception as e:
-            st.error(f"계정 연동 실패: {str(e)}")
+            err_msg = f"계정 연동 실패: {str(e)}"
+            print(f"[OAuth Callback Error] {err_msg}", flush=True)
+            st.session_state["oauth_status"] = ("error", err_msg)
         finally:
             st.query_params.clear()
+            st.rerun()
+
+
+# Display persistent OAuth Status Message if present
+if "oauth_status" in st.session_state:
+    status_type, status_text = st.session_state.pop("oauth_status")
+    if status_type == "success":
+        st.success(status_text)
+        st.balloons()
+    else:
+        st.error(status_text)
+
+# Refresh tokens list
+tokens = db.get_all_tokens()
+
+# Main Top Status Banner
+if tokens:
+    connected_names = " | ".join([f"**{t['channel_title']}** (`{t['channel_id']}`)" for t in tokens])
+    st.info(f"🔗 **현재 연동된 YouTube 채널 ({len(tokens)}개):** {connected_names}")
+else:
+    st.warning("⚠️ **연동된 YouTube 채널이 없습니다.** 아래 '1. 👥 연동 계정 관리' 탭에서 계정을 연동해 주세요.")
 
 
 # --- MAIN CONTENT TABS ---
@@ -162,7 +218,6 @@ with tab_accounts:
     st.subheader("연동된 YouTube 채널 목록")
     st.caption("개인 계정, 업무용 계정, 스터디용 브랜드 채널 등 여러 계정을 등록하여 통합 관리할 수 있습니다.")
 
-    tokens = db.get_all_tokens()
     if tokens:
         for idx, t in enumerate(tokens):
             with st.container(border=True):
@@ -192,7 +247,7 @@ with tab_accounts:
                 "client_secret": client_secret,
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": ["http://localhost:8501/", "http://localhost:8080/"],
+                "redirect_uris": ["http://localhost:8501/", "http://localhost:8501", "http://localhost:8080/"],
             }
         }
 
@@ -202,20 +257,22 @@ with tab_accounts:
                 scopes=collector.SCOPES,
                 redirect_uri="http://localhost:8501/",
             )
+            flow.autogenerate_code_verifier = False
             auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
 
             st.markdown("""
             **원클릭 계정 연동 안내:**  
-            아래 버튼을 클릭하면 Google 로그인 창이 열립니다. 연동할 **Google 계정 또는 브랜드 채널**을 선택하고 권한을 허용하시면, 자동으로 이 대시보드(`localhost:8501`)로 돌아오며 연동이 즉시 완료됩니다.
+            아래 버튼을 클릭하면 Google 로그인 및 채널 선택 창이 열립니다.  
+            구독 목록을 가져올 **계정 또는 브랜드 채널**을 선택하고 권한을 허용하시면, 자동으로 이 대시보드(`localhost:8501`)로 돌아오며 즉시 연동됩니다.
             """)
 
             st.link_button(
-                "🚀 [클릭] Google 계정 로그인 및 채널 선택하기",
+                "🚀 [원클릭] Google 계정 로그인 및 채널 선택하기",
                 auth_url,
                 type="primary",
                 use_container_width=True,
             )
-            st.caption("ℹ️ 버튼 클릭 시 새 탭 또는 현재 창에서 Google 인증 화면이 열립니다.")
+            st.caption("ℹ️ 클릭 시 Google 로그인 화면으로 이동합니다.")
 
         except Exception as e:
             st.error(f"인증 URL 생성 실패: {str(e)}")
@@ -235,7 +292,7 @@ with tab_accounts:
             with col_m2:
                 redirect_choice = st.selectbox(
                     "사용한 리다이렉트 URI:",
-                    ["http://localhost:8501/", "http://localhost:8080/"],
+                    ["http://localhost:8501/", "http://localhost:8501", "http://localhost:8080/"],
                 )
 
             if st.button("수동 연동 등록 완료", use_container_width=True):
@@ -252,16 +309,19 @@ with tab_accounts:
                             scopes=collector.SCOPES,
                             redirect_uri=redirect_choice,
                         )
+                        manual_flow.autogenerate_code_verifier = False
                         manual_flow.fetch_token(code=code)
                         creds = manual_flow.credentials
                         yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
                         my_channels = yt.channels().list(part="snippet", mine=True).execute()
-                        if not my_channels.get("items"):
-                            raise RuntimeError("선택한 계정에서 YouTube 채널 정보를 찾을 수 없습니다.")
 
-                        ch_info = my_channels["items"][0]
-                        c_id = ch_info["id"]
-                        c_title = ch_info["snippet"]["title"]
+                        if my_channels.get("items"):
+                            ch_info = my_channels["items"][0]
+                            c_id = ch_info["id"]
+                            c_title = ch_info["snippet"]["title"]
+                        else:
+                            c_id = f"user_{creds.client_id[:12]}"
+                            c_title = "Google Linked Account (기본 계정)"
 
                         db.upsert_token(
                             channel_id=c_id,
@@ -271,7 +331,7 @@ with tab_accounts:
                             access_token=creds.token,
                             expiry=creds.expiry,
                         )
-                        st.success(f"🎉 채널 '{c_title}' ({c_id}) 연동이 성공적으로 등록되었습니다!")
+                        st.session_state["oauth_status"] = ("success", f"🎉 채널 **'{c_title}'** ({c_id}) 수동 연동이 성공적으로 등록되었습니다!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"수동 연동 실패: {str(e)}")
@@ -291,11 +351,14 @@ with tab_sync:
 
     tokens = db.get_all_tokens()
     if not tokens:
-        st.warning("⚠️ 등록된 연동 계정이 없습니다. '1. 연동 계정 관리' 탭에서 먼저 계정을 추가하세요.")
+        st.warning("⚠️ **등록된 연동 계정이 없습니다.** '1. 👥 연동 계정 관리' 탭으로 이동하여 YouTube 채널을 먼저 연동해 주세요.")
     elif not client_id or not client_secret:
         st.warning("⚠️ 사이드바에서 Client ID와 Secret을 먼저 설정하세요.")
     else:
-        st.success(f"현재 총 **{len(tokens)}개**의 계정/채널이 동기화 대상으로 등록되어 있습니다.")
+        st.markdown("#### 📋 동기화 대상 연동 채널:")
+        for t in tokens:
+            st.markdown(f"- 📺 **{t['channel_title']}** (`{t['channel_id']}`) — *등록일: {t['created_at']}*")
+        st.caption(f"총 **{len(tokens)}개** 채널의 구독 목록을 순회하여 중복 없이 수집합니다.")
 
         if st.button("▶ 전체 동기화 파이프라인 실행", type="primary", use_container_width=True):
             progress_bar = st.progress(0.0)
