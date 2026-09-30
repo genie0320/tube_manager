@@ -100,6 +100,53 @@ st.sidebar.divider()
 st.sidebar.info("💡 **TubeSSOT v1.0**\n단일 진실 공급원(SSOT) 기반 YouTube 구독 자산 및 수명주기 관리자")
 
 
+# --- OAuth Callback Handler (Redirect from Google) ---
+if "code" in st.query_params and client_id and client_secret:
+    auth_code = st.query_params["code"]
+    with st.spinner("Google 계정 인증 정보를 등록하는 중입니다..."):
+        try:
+            client_config = {
+                "installed": {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost:8501/", "http://localhost:8080/"],
+                }
+            }
+            flow = Flow.from_client_config(
+                client_config,
+                scopes=collector.SCOPES,
+                redirect_uri="http://localhost:8501/",
+            )
+            flow.fetch_token(code=auth_code)
+            creds = flow.credentials
+
+            yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
+            my_channels = yt.channels().list(part="snippet", mine=True).execute()
+            if not my_channels.get("items"):
+                st.error("선택한 계정에서 YouTube 채널 정보를 찾을 수 없습니다. YouTube 채널이 개설되어 있는지 확인해 주세요.")
+            else:
+                ch_info = my_channels["items"][0]
+                c_id = ch_info["id"]
+                c_title = ch_info["snippet"]["title"]
+
+                db.upsert_token(
+                    channel_id=c_id,
+                    email="Linked Google Account",
+                    title=c_title,
+                    refresh_token=creds.refresh_token,
+                    access_token=creds.token,
+                    expiry=creds.expiry,
+                )
+                st.success(f"🎉 채널 '{c_title}' ({c_id}) 연동이 성공적으로 등록되었습니다!")
+                st.balloons()
+        except Exception as e:
+            st.error(f"계정 연동 실패: {str(e)}")
+        finally:
+            st.query_params.clear()
+
+
 # --- MAIN CONTENT TABS ---
 tab_accounts, tab_sync, tab_dashboard, tab_export = st.tabs([
     "1. 👥 연동 계정 관리",
@@ -139,47 +186,74 @@ with tab_accounts:
     if not client_id or not client_secret:
         st.warning("⚠️ 사이드바에서 먼저 **Google Client ID**와 **Google Client Secret**을 입력하고 저장해 주세요.")
     else:
-        auth_method = st.radio(
-            "인증 방식 선택:",
-            ["원클릭 자동 연동 (로컬 루프백 - 권장)", "수동 인증 코드 입력 (Fallback)"],
-            horizontal=True,
-        )
-
         client_config = {
             "installed": {
                 "client_id": client_id,
                 "client_secret": client_secret,
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": ["http://localhost:8080/"],
+                "redirect_uris": ["http://localhost:8501/", "http://localhost:8080/"],
             }
         }
 
-        if auth_method == "원클릭 자동 연동 (로컬 루프백 - 권장)":
+        try:
+            flow = Flow.from_client_config(
+                client_config,
+                scopes=collector.SCOPES,
+                redirect_uri="http://localhost:8501/",
+            )
+            auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+
             st.markdown("""
-            **원클릭 자동 연동 안내:**
-            1. 아래 **[🚀 브라우저 열고 계정 연동 시작]** 버튼을 누르면 기본 브라우저가 열립니다.
-            2. Google 로그인 후 구독 목록을 가져올 **브랜드 채널 또는 메인 계정**을 선택하세요.
-            3. 인증이 완료되면 브라우저 창에 인증 완료 메시지가 나타나며 이 화면으로 자동 복귀합니다.
-            *(참고: Google Cloud Console OAuth 클라이언트 승인된 리디렉션 URI에 `http://localhost:8080/`이 등록되어 있어야 합니다.)*
+            **원클릭 계정 연동 안내:**  
+            아래 버튼을 클릭하면 Google 로그인 창이 열립니다. 연동할 **Google 계정 또는 브랜드 채널**을 선택하고 권한을 허용하시면, 자동으로 이 대시보드(`localhost:8501`)로 돌아오며 연동이 즉시 완료됩니다.
             """)
 
-            if st.button("🚀 브라우저 열고 계정 연동 시작", type="primary"):
-                with st.spinner("로컬 인증 서버를 대기 중입니다. 브라우저에서 로그인을 완료해 주세요..."):
+            st.link_button(
+                "🚀 [클릭] Google 계정 로그인 및 채널 선택하기",
+                auth_url,
+                type="primary",
+                use_container_width=True,
+            )
+            st.caption("ℹ️ 버튼 클릭 시 새 탭 또는 현재 창에서 Google 인증 화면이 열립니다.")
+
+        except Exception as e:
+            st.error(f"인증 URL 생성 실패: {str(e)}")
+
+        st.markdown("---")
+        with st.expander("🛠️ 수동 인증 또는 다른 포트(8080) 리다이렉트 붙여넣기"):
+            st.markdown("""
+            Google 로그인 완료 후 브라우저 주소창이 `http://localhost:8080/?code=...` 등으로 이동하여 페이지가 열리지 않거나,
+            직접 인증 코드를 복사하신 경우 아래에 붙여넣어 수동 등록하실 수 있습니다.
+            """)
+            col_m1, col_m2 = st.columns([3, 1])
+            with col_m1:
+                manual_input = st.text_input(
+                    "주소창 전체 URL 또는 코드 붙여넣기:",
+                    placeholder="http://localhost:8080/?code=4/0A... 또는 4/0A...",
+                )
+            with col_m2:
+                redirect_choice = st.selectbox(
+                    "사용한 리다이렉트 URI:",
+                    ["http://localhost:8501/", "http://localhost:8080/"],
+                )
+
+            if st.button("수동 연동 등록 완료", use_container_width=True):
+                if manual_input.strip():
                     try:
-                        flow = InstalledAppFlow.from_client_config(
+                        raw_val = manual_input.strip()
+                        code = raw_val
+                        if "code=" in raw_val:
+                            parsed_qs = urllib.parse.parse_qs(urllib.parse.urlparse(raw_val).query)
+                            code = parsed_qs.get("code", [raw_val])[0]
+
+                        manual_flow = Flow.from_client_config(
                             client_config,
                             scopes=collector.SCOPES,
+                            redirect_uri=redirect_choice,
                         )
-                        creds = flow.run_local_server(
-                            host="localhost",
-                            port=8080,
-                            authorization_prompt_message="브라우저에서 Google 계정 인증을 진행해 주세요.",
-                            success_message="TubeSSOT 계정 연동이 성공적으로 완료되었습니다! 이 창을 닫고 앱으로 돌아가세요.",
-                            open_browser=True,
-                        )
-
-                        # Fetch linked channel info
+                        manual_flow.fetch_token(code=code)
+                        creds = manual_flow.credentials
                         yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
                         my_channels = yt.channels().list(part="snippet", mine=True).execute()
                         if not my_channels.get("items"):
@@ -200,60 +274,9 @@ with tab_accounts:
                         st.success(f"🎉 채널 '{c_title}' ({c_id}) 연동이 성공적으로 등록되었습니다!")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"연동 실패: {str(e)}")
-
-        else:
-            # Fallback manual method
-            st.markdown("""
-            **수동 인증 코드 입력 안내:**
-            로컬 포트(8080) 충돌 등으로 자동 연동이 원활하지 않을 때 사용합니다.
-            """)
-            flow = Flow.from_client_config(
-                client_config,
-                scopes=collector.SCOPES,
-                redirect_uri="http://localhost:8080/",
-            )
-            auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
-            st.markdown(f"[👉 여기를 클릭하여 Google 로그인 및 채널 선택 진행]({auth_url})")
-
-            manual_input = st.text_input(
-                "인증 완료 후 브라우저 주소창의 전체 URL 또는 code 파라미터 값을 붙여넣으세요:",
-                placeholder="http://localhost:8080/?code=4/0A... 또는 4/0A...",
-            )
-            if st.button("수동 연동 등록 완료"):
-                if manual_input.strip():
-                    try:
-                        raw_val = manual_input.strip()
-                        code = raw_val
-                        if "code=" in raw_val:
-                            parsed_qs = urllib.parse.parse_qs(urllib.parse.urlparse(raw_val).query)
-                            code = parsed_qs.get("code", [raw_val])[0]
-
-                        flow.fetch_token(code=code)
-                        creds = flow.credentials
-                        yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
-                        my_channels = yt.channels().list(part="snippet", mine=True).execute()
-                        if not my_channels.get("items"):
-                            raise RuntimeError("채널 정보를 가져올 수 없습니다.")
-
-                        ch_info = my_channels["items"][0]
-                        c_id = ch_info["id"]
-                        c_title = ch_info["snippet"]["title"]
-
-                        db.upsert_token(
-                            channel_id=c_id,
-                            email="Linked Google Account",
-                            title=c_title,
-                            refresh_token=creds.refresh_token,
-                            access_token=creds.token,
-                            expiry=creds.expiry,
-                        )
-                        st.success(f"채널 '{c_title}' 수동 연동 성공!")
-                        st.rerun()
-                    except Exception as e:
                         st.error(f"수동 연동 실패: {str(e)}")
                 else:
-                    st.warning("코드를 입력해 주세요.")
+                    st.warning("URL 또는 코드를 입력해 주세요.")
 
 
 # ==========================================
