@@ -195,7 +195,7 @@ def run_sync_pipeline(
                 p_res = yt_primary.playlistItems().list(
                     part="snippet",
                     playlistId=uploads_id,
-                    maxResults=3,
+                    maxResults=5,
                 ).execute()
                 db.log_quota(1, f"playlistItems.list for {c_id}")
 

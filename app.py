@@ -576,10 +576,10 @@ with tab_dashboard:
                     if ch_row["description"]:
                         st.caption(ch_row["description"][:300] + ("..." if len(ch_row["description"]) > 300 else ""))
 
-                st.markdown("#### 🎬 최근 영상 3개")
+                st.markdown("#### 🎬 최근 영상 목록 (최대 5개)")
                 recent_vids = ch_row["recent_videos"]
                 if recent_vids:
-                    num_cols = max(1, min(3, len(recent_vids)))
+                    num_cols = max(1, min(5, len(recent_vids)))
                     v_cols = st.columns(num_cols)
                     for v_idx, v in enumerate(recent_vids[:num_cols]):
                         with v_cols[v_idx]:
@@ -637,6 +637,8 @@ with tab_export:
                     "최근영상1": vids[0]["title"] if len(vids) > 0 else "",
                     "최근영상2": vids[1]["title"] if len(vids) > 1 else "",
                     "최근영상3": vids[2]["title"] if len(vids) > 2 else "",
+                    "최근영상4": vids[3]["title"] if len(vids) > 3 else "",
+                    "최근영상5": vids[4]["title"] if len(vids) > 4 else "",
                     "채널설명": (r["description"] or "").replace("\n", " "),
                 })
 
