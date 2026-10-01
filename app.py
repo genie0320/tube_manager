@@ -669,13 +669,13 @@ keep_df = master_df[master_df["review_status"] == "KEEP"] if not master_df.empty
 archived_df = master_df[master_df["review_status"] == "ARCHIVED"] if not master_df.empty else pd.DataFrame()
 
 
-# --- MAIN CONTENT TABS ---
+# --- MAIN CONTENT TABS (Static labels ensure active tab is preserved across reruns) ---
 tab_accounts, tab_sync, tab_inbox, tab_keep, tab_archive, tab_export = st.tabs([
-    f"1. 👥 연동 계정 ({len(tokens)})",
+    "1. 👥 연동 계정",
     "2. 🔄 수집 및 동기화",
-    f"3. 📥 미분류 ({len(inbox_df):,}개)",
-    f"4. 💚 유지 ({len(keep_df):,}개)",
-    f"5. 🗄️ 보류 ({len(archived_df):,}개)",
+    "3. 📥 미분류 채널 (Inbox)",
+    "4. 💚 유지 채널 (Keep)",
+    "5. 🗄️ 보류 보관함 (Archive)",
     "6. 📥 엑셀 내보내기",
 ])
 
@@ -937,7 +937,7 @@ with tab_sync:
             sc4.metric("🗄️ 보류 보관함 (정리 대상)", f"{len(archived_df):,}개")
 
             if len(inbox_df) > 0:
-                st.info(f"💡 현재 **{len(inbox_df):,}개**의 채널이 검토 대기 중입니다. 상단 **'3. 📥 미분류 ({len(inbox_df):,}개)'** 탭에서 채널들을 손쉽게 분류해 보세요.")
+                st.info(f"💡 현재 **{len(inbox_df):,}개**의 채널이 검토 대기 중입니다. 상단 **'3. 📥 미분류 채널 (Inbox)'** 탭에서 채널들을 손쉽게 분류해 보세요.")
             else:
                 st.success("🎉 모든 채널의 분류가 완료되었습니다 (Inbox Zero 달성)!")
         else:
@@ -948,7 +948,7 @@ with tab_sync:
 # TAB 3: 미분류 채널 대기열 (Inbox Zero)
 # ==========================================
 with tab_inbox:
-    st.subheader("📥 미분류 채널 대기열 (Inbox)")
+    st.subheader(f"📥 미분류 채널 대기열 (Inbox: {len(inbox_df):,}개 대기 중)")
     st.caption(
         "YouTube에서 새로 동기화된 채널들이 모이는 공간입니다. "
         "각 채널의 활동성을 확인하고 **[💚 유지]** 또는 **[📦 보류]**로 분류하여 대기열을 정리해 보세요 (Inbox Zero)."
@@ -1112,7 +1112,7 @@ with tab_inbox:
 # TAB 4: 유지 채널 관리 (Keep List)
 # ==========================================
 with tab_keep:
-    st.subheader("💚 유지 채널 (Keep - 구독 지속 확정 목록)")
+    st.subheader(f"💚 유지 채널 관리 (Keep: {len(keep_df):,}개 보관 중)")
     st.caption("계속해서 시청하고 최신 영상을 챙겨볼 구독 확정 채널들입니다. 언제든 [↩️ 미분류] 또는 [📦 보류]로 상태를 변경할 수 있습니다.")
 
     if keep_df.empty:
@@ -1254,7 +1254,7 @@ with tab_keep:
 # TAB 5: 보류 채널 보관함 (Archive Box)
 # ==========================================
 with tab_archive:
-    st.subheader("🗄️ 보류 채널 보관함 (Archived Subscriptions)")
+    st.subheader(f"🗄️ 보류 채널 보관함 (Archive: {len(archived_df):,}개 보관 중)")
     st.caption("더 이상 자주 보지 않거나 정리를 고려 중인 채널들을 임시 보관하는 공간입니다. 원할 때 언제든 **[💚 유지]** 또는 **[↩️ 미분류]**로 되돌릴 수 있습니다.")
 
     if archived_df.empty:
