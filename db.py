@@ -53,15 +53,19 @@ def init_db(db_file: str = DB_FILE) -> None:
             raw_subscription_json TEXT,
             raw_channel_json TEXT,
             is_archived INTEGER DEFAULT 0,
+            review_status TEXT CHECK(review_status IN ('INBOX', 'KEEP', 'ARCHIVED')) DEFAULT 'INBOX',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
 
-        # Migration: ensure is_archived column exists in existing database
+        # Migration: ensure is_archived and review_status columns exist in existing database
         cursor.execute("PRAGMA table_info(subscriptions_master);")
         cols = [row[1] for row in cursor.fetchall()]
         if cols and "is_archived" not in cols:
             cursor.execute("ALTER TABLE subscriptions_master ADD COLUMN is_archived INTEGER DEFAULT 0;")
+        if cols and "review_status" not in cols:
+            cursor.execute("ALTER TABLE subscriptions_master ADD COLUMN review_status TEXT DEFAULT 'INBOX';")
+            cursor.execute("UPDATE subscriptions_master SET review_status = 'ARCHIVED' WHERE is_archived = 1;")
 
         cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_subs_liveness ON subscriptions_master(liveness_status);
@@ -71,6 +75,9 @@ def init_db(db_file: str = DB_FILE) -> None:
         """)
         cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_subs_archived ON subscriptions_master(is_archived);
+        """)
+        cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_subs_review_status ON subscriptions_master(review_status);
         """)
 
         cursor.execute("""
@@ -138,26 +145,54 @@ def delete_master_channel(channel_id: str, db_file: str = DB_FILE) -> None:
         conn.commit()
 
 
-def set_channel_archived(channel_id: str, is_archived: bool = True, db_file: str = DB_FILE) -> None:
+def set_channel_status(channel_id: str, status: str, db_file: str = DB_FILE) -> None:
+    """Sets review_status to 'INBOX', 'KEEP', or 'ARCHIVED'. Also synchronizes is_archived."""
+    valid_statuses = {"INBOX", "KEEP", "ARCHIVED"}
+    status_upper = status.upper()
+    if status_upper not in valid_statuses:
+        raise ValueError(f"Invalid review status: {status}. Must be one of {valid_statuses}")
+    is_archived = 1 if status_upper == "ARCHIVED" else 0
     with get_connection(db_file) as conn:
         conn.execute(
-            "UPDATE subscriptions_master SET is_archived = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id = ?",
-            (1 if is_archived else 0, channel_id),
+            "UPDATE subscriptions_master SET review_status = ?, is_archived = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id = ?",
+            (status_upper, is_archived, channel_id),
         )
         conn.commit()
 
 
-def set_channels_archived_batch(channel_ids: List[str], is_archived: bool = True, db_file: str = DB_FILE) -> None:
+def set_channels_status_batch(channel_ids: List[str], status: str, db_file: str = DB_FILE) -> None:
+    """Batch sets review_status to 'INBOX', 'KEEP', or 'ARCHIVED'. Also synchronizes is_archived."""
     if not channel_ids:
         return
+    valid_statuses = {"INBOX", "KEEP", "ARCHIVED"}
+    status_upper = status.upper()
+    if status_upper not in valid_statuses:
+        raise ValueError(f"Invalid review status: {status}. Must be one of {valid_statuses}")
+    is_archived = 1 if status_upper == "ARCHIVED" else 0
     with get_connection(db_file) as conn:
         placeholders = ",".join(["?"] * len(channel_ids))
-        params = [1 if is_archived else 0] + list(channel_ids)
+        params = [status_upper, is_archived] + list(channel_ids)
         conn.execute(
-            f"UPDATE subscriptions_master SET is_archived = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id IN ({placeholders})",
+            f"UPDATE subscriptions_master SET review_status = ?, is_archived = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id IN ({placeholders})",
             params,
         )
         conn.commit()
+
+
+def set_channel_archived(channel_id: str, is_archived: bool = True, db_file: str = DB_FILE) -> None:
+    set_channel_status(channel_id, "ARCHIVED" if is_archived else "INBOX", db_file=db_file)
+
+
+def set_channels_archived_batch(channel_ids: List[str], is_archived: bool = True, db_file: str = DB_FILE) -> None:
+    set_channels_status_batch(channel_ids, "ARCHIVED" if is_archived else "INBOX", db_file=db_file)
+
+
+def set_channel_keep(channel_id: str, db_file: str = DB_FILE) -> None:
+    set_channel_status(channel_id, "KEEP", db_file=db_file)
+
+
+def set_channels_keep_batch(channel_ids: List[str], db_file: str = DB_FILE) -> None:
+    set_channels_status_batch(channel_ids, "KEEP", db_file=db_file)
 
 
 

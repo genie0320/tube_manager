@@ -146,14 +146,38 @@ class CoreLogicTestCase(unittest.TestCase):
         self.assertEqual(row["days_since_last_upload"], 10)
         self.assertEqual(row["is_archived"], 0)
 
+        # Initial review_status should be INBOX
+        self.assertEqual(row["review_status"], "INBOX")
+
+        # Test keep status
+        db.set_channel_keep("UC_sub_target", db_file=TEST_DB)
+        records_after_keep = db.fetch_master_records(TEST_DB)
+        self.assertEqual(records_after_keep[0]["review_status"], "KEEP")
+        self.assertEqual(records_after_keep[0]["is_archived"], 0)
+
         # Test archive & restore
         db.set_channel_archived("UC_sub_target", True, db_file=TEST_DB)
         records_after_archive = db.fetch_master_records(TEST_DB)
         self.assertEqual(records_after_archive[0]["is_archived"], 1)
+        self.assertEqual(records_after_archive[0]["review_status"], "ARCHIVED")
 
         db.set_channel_archived("UC_sub_target", False, db_file=TEST_DB)
         records_after_restore = db.fetch_master_records(TEST_DB)
         self.assertEqual(records_after_restore[0]["is_archived"], 0)
+        self.assertEqual(records_after_restore[0]["review_status"], "INBOX")
+
+        # Test batch status
+        db.set_channels_keep_batch(["UC_sub_target"], db_file=TEST_DB)
+        records_batch = db.fetch_master_records(TEST_DB)
+        self.assertEqual(records_batch[0]["review_status"], "KEEP")
+
+        # Test that upserting same channel again PRESERVES review_status 'KEEP'
+        record["title"] = "Awesome Tech Channel Updated"
+        db.upsert_subscription_record(record, db_file=TEST_DB)
+        records_after_reupsert = db.fetch_master_records(TEST_DB)
+        self.assertEqual(records_after_reupsert[0]["title"], "Awesome Tech Channel Updated")
+        self.assertEqual(records_after_reupsert[0]["review_status"], "KEEP")
+        self.assertEqual(records_after_reupsert[0]["is_archived"], 0)
 
         # JSON deserialization checks
         cats = json.loads(row["categories"])
