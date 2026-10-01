@@ -1,6 +1,7 @@
 import html
 import io
 import json
+import math
 import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List
@@ -384,12 +385,30 @@ def show_channel_modal(ch: dict):
         })
 
 
+def _step_page(key: str, delta: int, max_pages: int):
+    cur = st.session_state.get(key, 1)
+    st.session_state[key] = max(1, min(max_pages, cur + delta))
+
+
+def _set_page(key: str, target: int):
+    st.session_state[key] = target
+
+
+def _on_load_more_cards(key: str, inc: int, max_val: int):
+    cur = st.session_state.get(key, 24)
+    st.session_state[key] = min(max_val, cur + inc)
+
+
+def _on_expand_all_cards(key: str, max_val: int):
+    st.session_state[key] = max_val
+
+
 def render_channel_cards_grid(
     items: List[Dict[str, Any]],
     view_type: str = "inbox",  # "inbox", "keep", "archive"
     page_key_prefix: str = "inbox",
 ):
-    """Renders a responsive 3-column card grid with infinite scroll on user scroll."""
+    """Renders a responsive 3-column card grid with pagination, batch options, and robust infinite scroll."""
     if not items:
         if view_type == "inbox":
             st.success("🎉 **미분류 채널이 없습니다 (Inbox Zero 달성)!**\n\n모든 구독 채널이 '유지' 또는 '보류'로 성공적으로 분류되었습니다. 새로운 계정/채널을 동기화하면 새 구독이 이곳에 나타납니다.")
@@ -399,19 +418,156 @@ def render_channel_cards_grid(
             st.info("ℹ️ 현재 보류된 채널이 없습니다. 불필요하거나 정리가 필요한 채널 카드의 **[📦 보류]** 버튼을 누르면 이 보관함으로 이동합니다.")
         return
 
-    batch_size = 24
     total_cards = len(items)
 
+    # --- TOP NAVIGATION & VIEW CONTROL TOOLBAR ---
+    nav_mode_key = f"{page_key_prefix}_nav_mode"
+    batch_size_key = f"{page_key_prefix}_batch_size"
+    page_key = f"{page_key_prefix}_page"
     visible_key = f"{page_key_prefix}_visible_count"
+    bulk_key = f"{page_key_prefix}_bulk_mode"
+
+    if nav_mode_key not in st.session_state:
+        st.session_state[nav_mode_key] = "📄 페이지별 탐색 (추천)"
+    if batch_size_key not in st.session_state:
+        st.session_state[batch_size_key] = 24
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 1
     if visible_key not in st.session_state:
-        st.session_state[visible_key] = batch_size
+        st.session_state[visible_key] = 24
 
-    # Limit slice to available items
-    current_visible = min(total_cards, st.session_state[visible_key])
-    page_items = items[:current_visible]
+    with st.container(border=True):
+        t_col1, t_col2, t_col3, t_col4 = st.columns([2.2, 1.2, 2.4, 1.2])
+        with t_col1:
+            nav_mode = st.radio(
+                "탐색 방식:",
+                ["📄 페이지별 탐색 (추천)", "📜 무한 스크롤", "🚀 한 번에 전체 보기"],
+                horizontal=True,
+                key=nav_mode_key,
+                help="채널 수가 많을 때는 '페이지별 탐색'을 선택하면 브라우저 렉 없이 가장 빠르고 안정적입니다.",
+            )
+        with t_col2:
+            if nav_mode != "🚀 한 번에 전체 보기":
+                batch_size = st.selectbox(
+                    "한 번에 볼 개수:",
+                    options=[24, 48, 96],
+                    format_func=lambda x: f"{x}개씩",
+                    key=batch_size_key,
+                )
+            else:
+                batch_size = total_cards
+                st.caption(f"전체 **{total_cards:,}개** 표시")
 
-    # Live progress caption
-    st.caption(f"📊 현재 **{current_visible:,}개** / 전체 **{total_cards:,}개** 채널 노출 중 (아래로 스크롤 시 자동 추가 로딩)")
+        # Handle slicing based on mode
+        if nav_mode == "📄 페이지별 탐색 (추천)":
+            total_pages = max(1, math.ceil(total_cards / batch_size))
+            curr_page = st.session_state.get(page_key, 1)
+            if curr_page > total_pages:
+                curr_page = total_pages
+                st.session_state[page_key] = curr_page
+            if curr_page < 1:
+                curr_page = 1
+                st.session_state[page_key] = curr_page
+
+            with t_col3:
+                st.write("")  # vertical align
+                p_c1, p_c2, p_c3, p_c4, p_c5 = st.columns([1, 1, 2.5, 1, 1])
+                with p_c1:
+                    st.button("⏮️", key=f"top_first_{page_key_prefix}", on_click=_set_page, args=(page_key, 1), disabled=(curr_page <= 1), help="첫 페이지")
+                with p_c2:
+                    st.button("◀", key=f"top_prev_{page_key_prefix}", on_click=_step_page, args=(page_key, -1, total_pages), disabled=(curr_page <= 1), help="이전 페이지")
+                with p_c3:
+                    st.markdown(f"<div style='text-align: center; font-weight: 700; padding-top: 6px; font-size: 0.92rem;'>{curr_page} / {total_pages} 쪽</div>", unsafe_allow_html=True)
+                with p_c4:
+                    st.button("▶", key=f"top_next_{page_key_prefix}", on_click=_step_page, args=(page_key, 1, total_pages), disabled=(curr_page >= total_pages), help="다음 페이지")
+                with p_c5:
+                    st.button("⏭️", key=f"top_last_{page_key_prefix}", on_click=_set_page, args=(page_key, total_pages), disabled=(curr_page >= total_pages), help="마지막 페이지")
+
+            start_idx = (curr_page - 1) * batch_size
+            end_idx = min(total_cards, start_idx + batch_size)
+            page_items = items[start_idx:end_idx]
+
+        elif nav_mode == "📜 무한 스크롤":
+            current_visible = min(total_cards, st.session_state.get(visible_key, batch_size))
+            if current_visible < batch_size:
+                current_visible = min(total_cards, batch_size)
+                st.session_state[visible_key] = current_visible
+            page_items = items[:current_visible]
+
+            with t_col3:
+                st.write("")
+                st.markdown(f"<div style='padding-top: 6px; font-weight: 600; font-size: 0.88rem; color: #888;'>현재 {current_visible:,}개 / 전체 {total_cards:,}개</div>", unsafe_allow_html=True)
+
+        else:  # "🚀 한 번에 전체 보기"
+            page_items = items
+            with t_col3:
+                st.write("")
+                st.markdown(f"<div style='padding-top: 6px; font-weight: 600; font-size: 0.88rem; color: #0F9D58;'>전체 {total_cards:,}개 한 화면 노출</div>", unsafe_allow_html=True)
+
+        with t_col4:
+            st.write("")
+            is_bulk = st.toggle("☑️ 선택 모드", key=bulk_key, help="체크박스로 여러 채널을 선택해 일괄 처리합니다.")
+
+    # Status caption
+    if nav_mode == "📄 페이지별 탐색 (추천)":
+        st.caption(f"📊 **{curr_page} / {total_pages} 페이지** (전체 **{total_cards:,}개** 중 **{start_idx + 1:,} ~ {end_idx:,}번째** 채널 표시 중)")
+    elif nav_mode == "📜 무한 스크롤":
+        st.caption(f"📊 현재 **{len(page_items):,}개** / 전체 **{total_cards:,}개** 채널 노출 중 (아래로 스크롤 시 자동 추가 로딩)")
+    else:
+        st.caption(f"📊 전체 **{total_cards:,}개** 채널이 한 화면에 모두 표시되고 있습니다.")
+
+    # Bulk Action Toolbar if enabled
+    if is_bulk:
+        checked_ids = [ch["channel_id"] for ch in page_items if st.session_state.get(f"chk_{page_key_prefix}_{ch['channel_id']}", False)]
+        with st.container(border=True):
+            b_c1, b_c2, b_c3, b_c4 = st.columns([2, 1.5, 1.5, 1.5])
+            with b_c1:
+                st.markdown(f"☑️ 현재 화면에서 **{len(checked_ids)}개** 채널 선택됨")
+            if view_type == "inbox":
+                with b_c2:
+                    if st.button(f"💚 선택 {len(checked_ids)}개 유지", disabled=(len(checked_ids) == 0), key=f"bulk_k_{page_key_prefix}", use_container_width=True):
+                        db.set_channels_keep_batch(checked_ids)
+                        for cid in checked_ids:
+                            st.session_state[f"chk_{page_key_prefix}_{cid}"] = False
+                        st.toast(f"{len(checked_ids)}개 채널이 유지 목록으로 이동되었습니다!", icon="💚")
+                        st.rerun()
+                with b_c3:
+                    if st.button(f"📦 선택 {len(checked_ids)}개 보류", disabled=(len(checked_ids) == 0), key=f"bulk_a_{page_key_prefix}", use_container_width=True):
+                        db.set_channels_archived_batch(checked_ids, True)
+                        for cid in checked_ids:
+                            st.session_state[f"chk_{page_key_prefix}_{cid}"] = False
+                        st.toast(f"{len(checked_ids)}개 채널이 보류 보관함으로 이동되었습니다!", icon="📦")
+                        st.rerun()
+            elif view_type == "keep":
+                with b_c2:
+                    if st.button(f"↩️ 선택 {len(checked_ids)}개 미분류", disabled=(len(checked_ids) == 0), key=f"bulk_i_{page_key_prefix}", use_container_width=True):
+                        db.set_channels_status_batch(checked_ids, "INBOX")
+                        for cid in checked_ids:
+                            st.session_state[f"chk_{page_key_prefix}_{cid}"] = False
+                        st.toast(f"{len(checked_ids)}개 채널이 미분류 상태로 복귀되었습니다!", icon="↩️")
+                        st.rerun()
+                with b_c3:
+                    if st.button(f"📦 선택 {len(checked_ids)}개 보류", disabled=(len(checked_ids) == 0), key=f"bulk_a_{page_key_prefix}", use_container_width=True):
+                        db.set_channels_archived_batch(checked_ids, True)
+                        for cid in checked_ids:
+                            st.session_state[f"chk_{page_key_prefix}_{cid}"] = False
+                        st.toast(f"{len(checked_ids)}개 채널이 보류 보관함으로 이동되었습니다!", icon="📦")
+                        st.rerun()
+            else:  # archive
+                with b_c2:
+                    if st.button(f"💚 선택 {len(checked_ids)}개 유지", disabled=(len(checked_ids) == 0), key=f"bulk_k_{page_key_prefix}", use_container_width=True):
+                        db.set_channels_keep_batch(checked_ids)
+                        for cid in checked_ids:
+                            st.session_state[f"chk_{page_key_prefix}_{cid}"] = False
+                        st.toast(f"{len(checked_ids)}개 채널이 유지 목록으로 이동되었습니다!", icon="💚")
+                        st.rerun()
+                with b_c3:
+                    if st.button(f"↩️ 선택 {len(checked_ids)}개 복원", disabled=(len(checked_ids) == 0), key=f"bulk_i_{page_key_prefix}", use_container_width=True):
+                        db.set_channels_status_batch(checked_ids, "INBOX")
+                        for cid in checked_ids:
+                            st.session_state[f"chk_{page_key_prefix}_{cid}"] = False
+                        st.toast(f"{len(checked_ids)}개 채널이 미분류 상태로 복원되었습니다!", icon="♻️")
+                        st.rerun()
 
     cards_per_row = 3
     for r_idx in range(0, len(page_items), cards_per_row):
@@ -422,6 +578,10 @@ def render_channel_cards_grid(
                 ch = page_items[item_idx]
                 with row_cols[c_idx]:
                     with st.container(border=True):
+                        # Bulk checkbox if mode active
+                        if is_bulk:
+                            st.checkbox("이 채널 선택", key=f"chk_{page_key_prefix}_{ch['channel_id']}")
+
                         # 1. Uniform Header (Status on top + 1-line title + handle, matching 76px thumbnail)
                         st.markdown(render_channel_card_header(ch, view_type=view_type), unsafe_allow_html=True)
 
@@ -517,103 +677,145 @@ def render_channel_cards_grid(
                                         st.toast(f"'{ch['title']}' 채널이 DB에서 삭제되었습니다.", icon="🗑️")
                                         st.rerun()
 
-    # Infinite Scroll Bottom Area
-    if current_visible < total_cards:
-        remaining = total_cards - current_visible
-        next_count = min(batch_size, remaining)
-        sentinel_id = f"sentinel_{page_key_prefix}"
+    # --- BOTTOM NAVIGATION AREA ---
+    if nav_mode == "📄 페이지별 탐색 (추천)":
+        st.markdown("---")
+        bot_c1, bot_c2, bot_c3, bot_c4, bot_c5, bot_top = st.columns([1, 1, 2.5, 1, 1, 1.5])
+        with bot_c1:
+            st.button("⏮️ 처음", key=f"bot_first_{page_key_prefix}", on_click=_set_page, args=(page_key, 1), disabled=(curr_page <= 1))
+        with bot_c2:
+            st.button("◀ 이전", key=f"bot_prev_{page_key_prefix}", on_click=_step_page, args=(page_key, -1, total_pages), disabled=(curr_page <= 1))
+        with bot_c3:
+            st.markdown(f"<div style='text-align: center; font-weight: 700; padding-top: 6px;'>{curr_page} / {total_pages} 페이지 ({start_idx + 1:,} ~ {end_idx:,}번째)</div>", unsafe_allow_html=True)
+        with bot_c4:
+            st.button("다음 ▶", key=f"bot_next_{page_key_prefix}", on_click=_step_page, args=(page_key, 1, total_pages), disabled=(curr_page >= total_pages))
+        with bot_c5:
+            st.button("끝 ⏭️", key=f"bot_last_{page_key_prefix}", on_click=_set_page, args=(page_key, total_pages), disabled=(curr_page >= total_pages))
+        with bot_top:
+            if st.button("⬆️ 맨 위로", key=f"bot_top_{page_key_prefix}", use_container_width=True):
+                components.html("<script>window.parent.scrollTo({top: 0, behavior: 'smooth'});</script>", height=0, width=0)
 
-        # Sentinel element for IntersectionObserver
-        st.markdown(
-            f"""
-            <div id="{sentinel_id}" style="height: 40px; margin: 24px 0 10px 0; text-align: center; display: flex; align-items: center; justify-content: center; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px dashed rgba(255,255,255,0.18);">
-                <span style="color: #aaa; font-size: 0.88rem;">⏳ 아래로 스크롤하면 다음 {next_count}개 채널을 자동으로 불러옵니다...</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    elif nav_mode == "📜 무한 스크롤":
+        if current_visible < total_cards:
+            remaining = total_cards - current_visible
+            next_count = min(batch_size, remaining)
+            sentinel_id = f"sentinel_{page_key_prefix}"
 
-        # Fallback load more button
-        load_col1, load_col2, load_col3 = st.columns([1, 2, 1])
-        with load_col2:
-            if st.button(
-                f"⬇️ {next_count}개 더 불러오기 ({current_visible:,} / {total_cards:,})",
-                key=f"btn_more_{page_key_prefix}",
-                use_container_width=True,
-            ):
-                st.session_state[visible_key] = current_visible + batch_size
-                st.rerun()
+            # Sentinel element for IntersectionObserver
+            st.markdown(
+                f"""
+                <div id="{sentinel_id}" style="height: 40px; margin: 24px 0 10px 0; text-align: center; display: flex; align-items: center; justify-content: center; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px dashed rgba(255,255,255,0.18);">
+                    <span style="color: #aaa; font-size: 0.88rem;">⏳ 아래로 스크롤하면 다음 {next_count}개 채널을 자동으로 불러옵니다...</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        # JavaScript IntersectionObserver for butter-smooth automatic infinite scrolling
-        components.html(
-            f"""
-            <script>
-            (function() {{
-                try {{
-                    const parentWin = window.parent;
-                    const parentDoc = parentWin.document;
-                    const sentinel = parentDoc.getElementById("{sentinel_id}");
+            # Manual buttons
+            load_col1, load_col2, load_col3, load_col4 = st.columns([1, 2, 2, 1])
+            with load_col2:
+                st.button(
+                    f"⬇️ {next_count}개 더 불러오기 ({current_visible:,} / {total_cards:,})",
+                    key=f"btn_more_{page_key_prefix}_{current_visible}",
+                    on_click=_on_load_more_cards,
+                    args=(visible_key, batch_size, total_cards),
+                    use_container_width=True,
+                )
+            with load_col3:
+                st.button(
+                    f"🚀 나머지 {remaining:,}개 한 번에 모두 펼치기",
+                    key=f"btn_expand_all_{page_key_prefix}_{current_visible}",
+                    on_click=_on_expand_all_cards,
+                    args=(visible_key, total_cards),
+                    use_container_width=True,
+                )
 
-                    parentWin.__isLoadingMore = false;
+            # JavaScript IntersectionObserver with automatic unlock and remounting iframe
+            components.html(
+                f"""
+                <script>
+                (function() {{
+                    try {{
+                        const parentWin = window.parent;
+                        const parentDoc = parentWin.document;
+                        const sentinel = parentDoc.getElementById("{sentinel_id}");
 
-                    if (sentinel && parentWin.IntersectionObserver) {{
-                        const observer = new parentWin.IntersectionObserver((entries) => {{
-                            entries.forEach(entry => {{
-                                if (entry.isIntersecting && !parentWin.__isLoadingMore) {{
-                                    const buttons = Array.from(parentDoc.querySelectorAll('button'));
-                                    const loadBtn = buttons.find(b => 
-                                        b.offsetParent !== null && 
-                                        (b.innerText || b.textContent || '').includes('더 불러오기')
-                                    );
-                                    if (loadBtn) {{
-                                        parentWin.__isLoadingMore = true;
-                                        observer.disconnect();
-                                        loadBtn.click();
+                        parentWin.__isLoadingMore = false;
+                        if (parentWin.__loadUnlockTimer) {{
+                            clearTimeout(parentWin.__loadUnlockTimer);
+                        }}
+                        if (parentWin.__activeObserver) {{
+                            try {{ parentWin.__activeObserver.disconnect(); }} catch(e) {{}}
+                        }}
+
+                        if (sentinel && parentWin.IntersectionObserver) {{
+                            const observer = new parentWin.IntersectionObserver((entries) => {{
+                                entries.forEach(entry => {{
+                                    if (entry.isIntersecting && !parentWin.__isLoadingMore) {{
+                                        const buttons = Array.from(parentDoc.querySelectorAll('button'));
+                                        const loadBtn = buttons.find(b => 
+                                            b.offsetParent !== null && 
+                                            (b.innerText || b.textContent || '').includes('더 불러오기')
+                                        );
+                                        if (loadBtn) {{
+                                            parentWin.__isLoadingMore = true;
+                                            parentWin.__loadUnlockTimer = setTimeout(() => {{
+                                                parentWin.__isLoadingMore = false;
+                                            }}, 2500);
+                                            observer.disconnect();
+                                            loadBtn.click();
+                                        }}
                                     }}
-                                }}
+                                }});
+                            }}, {{
+                                root: null,
+                                rootMargin: '500px',
+                                threshold: 0.01
                             }});
-                        }}, {{
-                            root: null,
-                            rootMargin: '400px',
-                            threshold: 0.01
-                        }});
 
-                        observer.observe(sentinel);
+                            parentWin.__activeObserver = observer;
+                            observer.observe(sentinel);
+                        }}
+                    }} catch(err) {{
+                        console.error("Infinite scroll error:", err);
                     }}
-                }} catch(err) {{
-                    console.error("Infinite scroll error:", err);
-                }}
-            }})();
-            </script>
-            """,
-            height=0,
-            width=0,
-        )
-    else:
+                }})();
+                </script>
+                """,
+                height=0,
+                width=0,
+                key=f"scroller_{page_key_prefix}_{current_visible}",
+            )
+        else:
+            st.markdown(
+                f"""
+                <div style="text-align: center; padding: 30px 0 10px 0; color: #888;">
+                    <div style="font-size: 1.4rem; margin-bottom: 4px;">🎉</div>
+                    <div style="font-weight: 600; font-size: 0.95rem;">모든 채널 ({total_cards:,}개)을 다 불러왔습니다.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            top_c1, top_c2, top_c3 = st.columns([1.5, 1, 1.5])
+            with top_c2:
+                if st.button("⬆️ 맨 위로 이동", key=f"btn_top_{page_key_prefix}", use_container_width=True):
+                    components.html("<script>window.parent.scrollTo({top: 0, behavior: 'smooth'});</script>", height=0, width=0)
+
+    else:  # "🚀 한 번에 전체 보기"
         st.markdown(
             f"""
             <div style="text-align: center; padding: 30px 0 10px 0; color: #888;">
                 <div style="font-size: 1.4rem; margin-bottom: 4px;">🎉</div>
-                <div style="font-weight: 600; font-size: 0.95rem;">모든 채널 ({total_cards:,}개)을 다 불러왔습니다.</div>
+                <div style="font-weight: 600; font-size: 0.95rem;">전체 채널 ({total_cards:,}개)이 모두 펼쳐졌습니다.</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-
         top_c1, top_c2, top_c3 = st.columns([1.5, 1, 1.5])
         with top_c2:
-            if st.button("⬆️ 맨 위로 이동", key=f"btn_top_{page_key_prefix}", use_container_width=True):
-                components.html(
-                    """
-                    <script>
-                    try {
-                        window.parent.scrollTo({top: 0, behavior: 'smooth'});
-                    } catch(e) {}
-                    </script>
-                    """,
-                    height=0,
-                    width=0,
-                )
+            if st.button("⬆️ 맨 위로 이동", key=f"btn_top_all_{page_key_prefix}", use_container_width=True):
+                components.html("<script>window.parent.scrollTo({top: 0, behavior: 'smooth'});</script>", height=0, width=0)
 
 
 # --- PRELOAD MASTER RECORDS FOR DASHBOARD, TABS & EXPORT ---
@@ -1009,13 +1211,14 @@ with tab_inbox:
         if selected_source != "전체":
             filtered_inbox = filtered_inbox[filtered_inbox["source_accounts"].apply(lambda srcs: selected_source in srcs)]
 
-        # Smart Batch Action
-        with st.expander("⚡ 미분류 채널 스마트 일괄 관리 (원클릭 정리)"):
+        # Smart Batch Action (Prominent 1-click batch cleanup for filtered channels)
+        with st.container(border=True):
+            st.markdown("##### ⚡ 필터링된 채널 빠른 일괄 정리 (원클릭 처리)")
             col_b1, col_b2, col_b3 = st.columns(3)
             with col_b1:
                 green_ids = filtered_inbox[filtered_inbox["liveness_status"] == "GREEN"]["channel_id"].tolist()
                 if st.button(
-                    f"💚 필터 활성(🟢) {len(green_ids)}개 일괄 유지",
+                    f"💚 필터 활성(🟢) {len(green_ids):,}개 일괄 유지",
                     disabled=(len(green_ids) == 0),
                     help="현재 검색/필터 결과 중 90일 이내에 업로드된 활성 채널들을 [유지]로 한 번에 이동합니다.",
                     key="batch_inbox_keep_green",
@@ -1026,10 +1229,12 @@ with tab_inbox:
                     st.rerun()
             with col_b2:
                 red_ids = filtered_inbox[filtered_inbox["liveness_status"] == "RED"]["channel_id"].tolist()
+                is_red_filter = (selected_statuses == ["RED"])
                 if st.button(
-                    f"📦 필터 휴면(🔴) {len(red_ids)}개 일괄 보류",
+                    f"📦 필터 휴면(🔴) {len(red_ids):,}개 일괄 보류",
                     disabled=(len(red_ids) == 0),
-                    help="현재 검색/필터 결과 중 180일 이상 미업로드된 휴면 채널들을 [보류]로 한 번에 이동합니다.",
+                    type="primary" if (len(red_ids) > 0 and is_red_filter) else "secondary",
+                    help="현재 검색/필터 결과 중 180일 이상 미업로드된 휴면 채널들을 [보류] 보관함으로 한 번에 이동합니다.",
                     key="batch_inbox_arch_red",
                     use_container_width=True,
                 ):
@@ -1039,7 +1244,7 @@ with tab_inbox:
             with col_b3:
                 all_f_ids = filtered_inbox["channel_id"].tolist()
                 if st.button(
-                    f"💚 필터 채널 전체 ({len(all_f_ids)}개) 일괄 유지",
+                    f"💚 필터 채널 전체 ({len(all_f_ids):,}개) 일괄 유지",
                     disabled=(len(all_f_ids) == 0),
                     help="현재 검색/필터된 모든 미분류 채널을 [유지]로 한 번에 이동합니다.",
                     key="batch_inbox_keep_all",
@@ -1049,11 +1254,12 @@ with tab_inbox:
                     st.toast(f"{len(all_f_ids)}개 채널이 유지 목록으로 이동되었습니다!", icon="💚")
                     st.rerun()
 
-        # Reset infinite scroll count if filters change
+        # Reset infinite scroll count and page if filters change
         current_inbox_hash = f"{selected_statuses}_{search_keyword}_{selected_category}_{selected_source}"
         if st.session_state.get("inbox_filter_hash") != current_inbox_hash:
             st.session_state["inbox_filter_hash"] = current_inbox_hash
             st.session_state["inbox_visible_count"] = 24
+            st.session_state["inbox_page"] = 1
 
         view_col1, view_col2 = st.columns([2, 2])
         with view_col1:
@@ -1166,12 +1372,13 @@ with tab_keep:
             filtered_keep = filtered_keep[filtered_keep["source_accounts"].apply(lambda srcs: k_selected_source in srcs)]
 
         # Smart Batch Action
-        with st.expander("⚡ 유지 채널 스마트 일괄 관리"):
+        with st.container(border=True):
+            st.markdown("##### ⚡ 유지 채널 스마트 일괄 관리")
             col_kb1, col_kb2 = st.columns(2)
             with col_kb1:
                 k_red_ids = filtered_keep[filtered_keep["liveness_status"] == "RED"]["channel_id"].tolist()
                 if st.button(
-                    f"📦 필터 휴면(🔴) {len(k_red_ids)}개 일괄 보류 이동",
+                    f"📦 필터 휴면(🔴) {len(k_red_ids):,}개 일괄 보류 이동",
                     disabled=(len(k_red_ids) == 0),
                     help="유지 목록 중 180일 이상 미업로드된 휴면 채널들을 보류 보관함으로 이동합니다.",
                     key="batch_keep_arch_red",
@@ -1183,7 +1390,7 @@ with tab_keep:
             with col_kb2:
                 k_all_ids = filtered_keep["channel_id"].tolist()
                 if st.button(
-                    f"↩️ 현재 필터 채널 전체 ({len(k_all_ids)}개) 미분류 복귀",
+                    f"↩️ 현재 필터 채널 전체 ({len(k_all_ids):,}개) 미분류 복귀",
                     disabled=(len(k_all_ids) == 0),
                     help="현재 필터된 유지 채널들을 다시 미분류(검토 대기열)로 복귀시킵니다.",
                     key="batch_keep_reset_inbox",
@@ -1193,10 +1400,12 @@ with tab_keep:
                     st.toast(f"{len(k_all_ids)}개 채널이 미분류 상태로 복귀되었습니다!", icon="↩️")
                     st.rerun()
 
+        # Reset infinite scroll count and page if filters change
         current_keep_hash = f"{k_selected_statuses}_{k_search_keyword}_{k_selected_category}_{k_selected_source}"
         if st.session_state.get("keep_filter_hash") != current_keep_hash:
             st.session_state["keep_filter_hash"] = current_keep_hash
             st.session_state["keep_visible_count"] = 24
+            st.session_state["keep_page"] = 1
 
         k_view_col1, k_view_col2 = st.columns([2, 2])
         with k_view_col1:
@@ -1266,7 +1475,8 @@ with tab_archive:
         am2.metric("전체 구독 대비 보류율", f"{(len(archived_df) / max(1, len(master_df)) * 100):.1f} %")
         am3.metric("유지 확정 채널 수", f"{len(keep_df):,} 개")
 
-        with st.expander("⚡ 보관함 일괄 작업"):
+        with st.container(border=True):
+            st.markdown("##### ⚡ 보류 보관함 일괄 작업")
             col_ab1, col_ab2 = st.columns(2)
             with col_ab1:
                 if st.button("💚 보류 채널 전체 일괄 유지로 이동", type="secondary", key="batch_arch_to_keep_btn", use_container_width=True):
@@ -1314,6 +1524,7 @@ with tab_archive:
         if st.session_state.get("arch_filter_hash") != current_arch_hash:
             st.session_state["arch_filter_hash"] = current_arch_hash
             st.session_state["archive_visible_count"] = 24
+            st.session_state["archive_page"] = 1
 
         aview_col1, aview_col2 = st.columns([2, 2])
         with aview_col1:
